@@ -1,0 +1,27 @@
+{
+  "name": "git-shit",
+  "version": "1.1.0",
+  "description": "git-flow feature workflow that ends in a PR into staging: publish the branch, open the Bitbucket/GitHub PR page pre-filled, and auto-click Create pull request.",
+  "keywords": [
+    "git",
+    "git shit",
+    "git-shit",
+    "git-flow",
+    "bitbucket",
+    "github",
+    "pull-request",
+    "workflow",
+    "cli"
+  ],
+  "bin": {
+    "git-shit": "bin/git-shit.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "author": "suprim12",
+  "license": "MIT"
+}
