@@ -4,18 +4,27 @@
 //
 // Workflow:
 //   1. git-shit start my-fix   -> runs `git flow feature start my-fix`
+//                                  (add a base to branch off something else,
+//                                   e.g. `git-shit start my-fix production` —
+//                                   the base then becomes this branch's
+//                                   default PR target)
 //   2. ...do your work, commit as usual...
-//   3. git-shit ship           -> pushes the feature branch, opens the
-//                                  pre-filled PR page in Chrome, waits
-//                                  for it to load, and auto-clicks
-//                                  "Create pull request". You just
-//                                  click Merge.
+//   3. git-shit ship           -> pushes the feature branch and opens a PR.
+//                                  GitHub remote + gh CLI logged in: the PR
+//                                  is created straight from the terminal.
+//                                  Otherwise: opens the pre-filled PR page in
+//                                  Chrome and auto-clicks "Create pull request".
+//   4. git-shit merge          -> (GitHub + gh) merges the open PR from the
+//                                  terminal, then cleans up like `done`.
+//                                  Browser flow: click Merge yourself, then
+//                                  run `git-shit done`.
 //
-// One-time Chrome setup (required for the auto-click):
+// One-time Chrome setup (only for the browser-fallback auto-click):
 //   Chrome menu bar -> View -> Developer -> Allow JavaScript from Apple Events
 //   (Without it, the tool still opens the PR page; you click Create yourself.)
 //
-// Requires: git, git-flow, macOS + Google Chrome for the auto-click
+// Requires: git, git-flow. Terminal PRs need the GitHub CLI (`gh`, logged in);
+//           the browser fallback needs macOS + Google Chrome for the auto-click.
 //
 // Notes:
 //   - Workspace + repo slug are auto-detected from the `origin` remote URL.
@@ -61,14 +70,67 @@ function featurePrefix() {
   }
 }
 
+// Base recorded by `start <name> <base>` for this feature branch, if any.
+// ship/done/status use it as the branch's default PR target. The config entry
+// is removed automatically when the branch is deleted.
+function branchBase(branch) {
+  try {
+    return git(['config', `branch.${branch}.gitshitbase`]);
+  } catch {
+    return '';
+  }
+}
+
+// --- GitHub CLI (gh) integration --------------------------------------------
+// When the origin remote is GitHub and `gh` is installed and logged in, PRs
+// are created and merged straight from the terminal — no browser hack needed.
+// Bitbucket remotes (or a missing/logged-out gh) keep the browser flow.
+
+let ghOk = null;
+function ghUsable(repo) {
+  if (repo.host !== 'github') return false;
+  if (ghOk === null) {
+    ghOk =
+      commandExists('gh') &&
+      spawnSync('gh', ['auth', 'status', '--hostname', 'github.com'], { stdio: 'ignore' })
+        .status === 0;
+  }
+  return ghOk;
+}
+
+// Run gh and parse its JSON output; null on any failure (e.g. no PR found).
+function ghJson(args) {
+  const r = spawnSync('gh', args, { encoding: 'utf8' });
+  if (r.status !== 0) return null;
+  try {
+    return JSON.parse(r.stdout);
+  } catch {
+    return null;
+  }
+}
+
 function usage() {
   console.log(`Usage:
-  ${PROG} start <name>   Start a new git-flow feature
-  ${PROG} ship [dest]    Push current feature, open PR page, auto-click Create
-                         (dest = PR target branch, default: ${BASE_BRANCH})
-  ${PROG} done [dest]    After the PR is merged: checkout dest, pull, delete
+  ${PROG} start <name> [base]
+                         Start a new git-flow feature. With base, branch off
+                         origin/<base> (e.g. production) instead of git-flow's
+                         develop, and make <base> the default PR target for
+                         this branch.
+  ${PROG} ship [dest] [--draft] [--web]
+                         Push current feature and open a PR against dest
+                         (default: the branch's recorded base, else ${BASE_BRANCH}).
+                         On GitHub with the gh CLI the
+                         PR is created from the terminal (--draft for a draft
+                         PR, --web to force the browser flow). Bitbucket or no
+                         gh: opens the PR page in Chrome and auto-clicks Create.
+  ${PROG} merge [--merge|--squash|--rebase]
+                         Merge the feature's open PR with gh (GitHub only,
+                         default: --merge), then clean up like 'done'
+  ${PROG} done [dest]    After the PR is merged: checkout dest (default: the
+                         branch's recorded base, else ${BASE_BRANCH}), pull, delete
                          the local feature branch, prune stale refs
-  ${PROG} status         Show branch, publish state, and commits vs ${BASE_BRANCH}`);
+  ${PROG} status         Show branch, publish state, PR state, and commits
+                         vs the branch's base`);
   process.exit(1);
 }
 
@@ -201,8 +263,8 @@ end tell
   console.log('    Timed out waiting for the button — click Create pull request yourself.');
 }
 
-function cmdStart(name) {
-  if (!name) fail(`Usage: ${PROG} start <name>`);
+function cmdStart(name, base) {
+  if (!name) fail(`Usage: ${PROG} start <name> [base]`);
   const prefix = featurePrefix();
   const branch = `${prefix}${name}`;
 
@@ -239,19 +301,99 @@ function cmdStart(name) {
     );
   }
 
-  console.log(`==> git flow feature start ${name}`);
-  run('git', ['flow', 'feature', 'start', name]);
+  // Resolve the base to branch from (default: git-flow's develop branch).
+  // Prefer the just-fetched origin/<base> so the feature starts from the
+  // latest remote state, not a possibly stale local branch.
+  let baseRef = '';
+  if (base) {
+    const baseOnOrigin =
+      spawnSync('git', ['show-ref', '--verify', '--quiet', `refs/remotes/origin/${base}`], {
+        stdio: 'ignore',
+      }).status === 0;
+    const baseLocal =
+      spawnSync('git', ['show-ref', '--verify', '--quiet', `refs/heads/${base}`], {
+        stdio: 'ignore',
+      }).status === 0;
+    if (baseOnOrigin) {
+      baseRef = `origin/${base}`;
+    } else if (baseLocal) {
+      baseRef = base;
+      console.log(`    (base '${base}' not found on origin — using the local branch)`);
+    } else {
+      fail(
+        `Base branch '${base}' not found on origin or locally.`,
+        `Usage: ${PROG} start <name> [base]`
+      );
+    }
+  }
+
+  console.log(`==> git flow feature start ${name}${baseRef ? ` ${baseRef}` : ''}`);
+  run('git', ['flow', 'feature', 'start', name, ...(baseRef ? [baseRef] : [])]);
+
+  if (base) {
+    // Branching off origin/<base> makes git track it as upstream — drop that
+    // so `git pull` / the Published check don't point at the base branch.
+    // (`git flow feature publish` sets the real upstream later.)
+    spawnSync('git', ['branch', '--unset-upstream', branch], { stdio: 'ignore' });
+    // Remember the base: ship/done/status default to it for this branch.
+    run('git', ['config', `branch.${branch}.gitshitbase`, base]);
+  }
+
   console.log('');
-  console.log(`Feature branch '${featurePrefix()}${name}' created.`);
+  console.log(`Feature branch '${branch}' created${baseRef ? ` from ${baseRef}` : ''}.`);
+  if (base) console.log(`PRs from this branch will target '${base}' by default.`);
   console.log(`Do your work, commit, then run: ${PROG} ship`);
 }
 
-async function cmdShip(dest) {
-  const baseBranch = dest || BASE_BRANCH;
+// Create the PR with `gh pr create` (or recognise the one already open).
+function shipViaGh(branch, baseBranch, draft) {
+  const existing = ghJson(['pr', 'view', branch, '--json', 'number,url,state,isDraft']);
+  if (existing && existing.state === 'OPEN') {
+    console.log(
+      `==> PR #${existing.number}${existing.isDraft ? ' (draft)' : ''} already open — it now has your latest commits.`
+    );
+    console.log(`    ${existing.url}`);
+  } else {
+    let title = '';
+    let body = '';
+    try {
+      title = git(['log', '-1', '--pretty=%s']);
+    } catch {}
+    try {
+      body = git(['log', '-1', '--pretty=%b']);
+    } catch {}
+
+    console.log(`==> Creating PR via gh: ${branch} -> ${baseBranch}${draft ? ' (draft)' : ''}`);
+    const args = [
+      'pr', 'create',
+      '--base', baseBranch,
+      '--head', branch,
+      '--title', title || branch,
+      '--body', body,
+    ];
+    if (draft) args.push('--draft');
+    run('gh', args);
+  }
+
+  console.log('');
+  console.log(`Check reviews/checks with: ${PROG} status`);
+  console.log(`When it's ready, merge and clean up with: ${PROG} merge`);
+}
+
+async function cmdShip(dest, opts = {}) {
   const repo = resolveRepo();
   const prefix = featurePrefix();
 
+  const useGh = !opts.web && ghUsable(repo);
+  if (opts.draft && !useGh) {
+    fail(
+      '--draft requires a GitHub remote with the gh CLI installed and logged in',
+      '(https://cli.github.com), and cannot be combined with --web.'
+    );
+  }
+
   const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
+  const baseBranch = dest || branchBase(branch) || BASE_BRANCH;
 
   if (!branch.startsWith(prefix)) {
     fail(
@@ -298,6 +440,16 @@ async function cmdShip(dest) {
     run('git', ['flow', 'feature', 'publish', featureName]);
   }
 
+  if (useGh) {
+    shipViaGh(branch, baseBranch, opts.draft);
+    return;
+  }
+
+  if (repo.host === 'github' && !opts.web) {
+    console.log('    (tip: install the GitHub CLI and run `gh auth login` to create');
+    console.log('     PRs straight from the terminal: https://cli.github.com)');
+  }
+
   const prUrl = buildPrUrl(repo, branch, baseBranch);
   console.log(`==> Opening PR page: ${branch} -> ${baseBranch}`);
   openUrl(prUrl);
@@ -305,15 +457,77 @@ async function cmdShip(dest) {
   await autoClickCreate();
 
   console.log('');
-  console.log('After merging in Chrome, sync up locally with:');
-  console.log(`  git checkout ${baseBranch} && git pull origin ${baseBranch}`);
-  console.log(`  git branch -D ${branch} && git fetch --prune origin`);
+  console.log('After merging in the browser, clean up locally with:');
+  console.log(`  ${PROG} done${baseBranch === BASE_BRANCH ? '' : ` ${baseBranch}`}`);
+}
+
+// Merge the current feature's open PR with gh, then clean up like `done`.
+function cmdMerge(strategy) {
+  const repo = resolveRepo();
+  const prefix = featurePrefix();
+  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
+
+  if (repo.host !== 'github') {
+    fail(
+      `'${PROG} merge' uses the GitHub CLI, and this origin is ${repo.host}.`,
+      `Merge the PR in the browser instead, then run: ${PROG} done`
+    );
+  }
+  if (!ghUsable(repo)) {
+    fail(
+      'GitHub CLI (gh) not found or not logged in.',
+      'Install it from https://cli.github.com then run: gh auth login',
+      `Or merge the PR in the browser and run: ${PROG} done`
+    );
+  }
+  if (!branch.startsWith(prefix)) {
+    fail(`Current branch '${branch}' is not a git-flow feature branch (${prefix}*).`);
+  }
+  if (git(['status', '--porcelain']) !== '') {
+    fail('You have uncommitted changes. Commit or stash them before merging.');
+  }
+
+  console.log('==> git fetch --prune origin');
+  run('git', ['fetch', '--prune', 'origin']);
+
+  const onOrigin =
+    spawnSync('git', ['show-ref', '--verify', '--quiet', `refs/remotes/origin/${branch}`], {
+      stdio: 'ignore',
+    }).status === 0;
+  if (!onOrigin) {
+    fail(`'${branch}' is not published to origin. Ship it first: ${PROG} ship`);
+  }
+
+  const unpushed = git(['rev-list', '--count', `origin/${branch}..HEAD`]);
+  if (unpushed !== '0') {
+    fail(
+      `You have ${unpushed} commit(s) on '${branch}' that are not pushed.`,
+      `Run '${PROG} ship' first so the PR is up to date.`
+    );
+  }
+
+  const pr = ghJson(['pr', 'view', branch, '--json', 'number,url,state,baseRefName,isDraft']);
+  if (!pr || pr.state !== 'OPEN') {
+    fail(`No open PR found for '${branch}'. Create one first: ${PROG} ship`);
+  }
+  if (pr.isDraft) {
+    fail(
+      `PR #${pr.number} is still a draft. Mark it ready first:`,
+      `  gh pr ready ${pr.number}`
+    );
+  }
+
+  console.log(`==> Merging PR #${pr.number} (${strategy.slice(2)}): ${branch} -> ${pr.baseRefName}`);
+  run('gh', ['pr', 'merge', String(pr.number), strategy]);
+
+  console.log('');
+  cmdDone(pr.baseRefName);
 }
 
 function cmdDone(dest) {
-  const baseBranch = dest || BASE_BRANCH;
   const prefix = featurePrefix();
   const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
+  const baseBranch = dest || branchBase(branch) || BASE_BRANCH;
 
   if (git(['status', '--porcelain']) !== '') {
     fail('You have uncommitted changes. Commit or stash them before cleaning up.');
@@ -353,8 +567,12 @@ function cmdStatus() {
   const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
   const isFeature = branch.startsWith(prefix);
   const dirty = git(['status', '--porcelain']) !== '';
+  const base = branchBase(branch) || BASE_BRANCH;
 
   console.log(`Branch:     ${branch}${isFeature ? '' : `  (not a ${prefix}* branch)`}`);
+  if (base !== BASE_BRANCH) {
+    console.log(`Base:       ${base} (recorded by '${PROG} start')`);
+  }
   console.log(`Changes:    ${dirty ? 'uncommitted changes present' : 'clean'}`);
 
   const onOrigin =
@@ -372,30 +590,66 @@ function cmdStatus() {
 
   try {
     // Counts are against the last-fetched origin/<base> ref.
-    const counts = git(['rev-list', '--left-right', '--count', `origin/${BASE_BRANCH}...HEAD`]);
+    const counts = git(['rev-list', '--left-right', '--count', `origin/${base}...HEAD`]);
     const [behind, ahead] = counts.split(/\s+/);
-    console.log(`vs ${BASE_BRANCH}: ${ahead} ahead, ${behind} behind origin/${BASE_BRANCH} (as of last fetch)`);
+    console.log(`vs ${base}: ${ahead} ahead, ${behind} behind origin/${base} (as of last fetch)`);
   } catch {
-    console.log(`vs ${BASE_BRANCH}: unknown (no origin/${BASE_BRANCH} ref — fetch first)`);
+    console.log(`vs ${base}: unknown (no origin/${base} ref — fetch first)`);
   }
 
   if (isFeature) {
     const repo = resolveRepo();
-    console.log(`PR page:    ${buildPrUrl(repo, branch, BASE_BRANCH)}`);
+    const pr = ghUsable(repo)
+      ? ghJson(['pr', 'view', branch, '--json', 'number,url,state,isDraft,reviewDecision,mergeStateStatus'])
+      : null;
+    if (pr) {
+      const bits = [pr.isDraft ? 'draft' : pr.state.toLowerCase()];
+      if (pr.reviewDecision) bits.push(`review: ${pr.reviewDecision.toLowerCase().replace(/_/g, ' ')}`);
+      if (pr.mergeStateStatus && pr.mergeStateStatus !== 'UNKNOWN') {
+        bits.push(`merge: ${pr.mergeStateStatus.toLowerCase()}`);
+      }
+      console.log(`PR:         #${pr.number} (${bits.join(', ')})`);
+      console.log(`            ${pr.url}`);
+    } else if (ghUsable(repo)) {
+      console.log(`PR:         none yet — create one with: ${PROG} ship`);
+    } else {
+      console.log(`PR page:    ${buildPrUrl(repo, branch, base)}`);
+    }
   }
 }
 
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
+  const flags = rest.filter((a) => a.startsWith('--'));
+  const pos = rest.filter((a) => !a.startsWith('--'));
+
   switch (cmd) {
     case 'start':
-      cmdStart(rest[0]);
+      cmdStart(pos[0], pos[1]);
       break;
-    case 'ship':
-      await cmdShip(rest[0]);
+    case 'ship': {
+      for (const f of flags) {
+        if (f !== '--draft' && f !== '--web') fail(`Unknown flag for ship: ${f}`);
+      }
+      await cmdShip(pos[0], {
+        draft: flags.includes('--draft'),
+        web: flags.includes('--web'),
+      });
       break;
+    }
+    case 'merge': {
+      const strategies = ['--merge', '--squash', '--rebase'];
+      const chosen = [];
+      for (const f of flags) {
+        if (!strategies.includes(f)) fail(`Unknown flag for merge: ${f}`);
+        if (!chosen.includes(f)) chosen.push(f);
+      }
+      if (chosen.length > 1) fail('Pick one of --merge, --squash, --rebase.');
+      cmdMerge(chosen[0] || '--merge');
+      break;
+    }
     case 'done':
-      cmdDone(rest[0]);
+      cmdDone(pos[0]);
       break;
     case 'status':
       cmdStatus();
