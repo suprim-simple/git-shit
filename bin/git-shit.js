@@ -394,12 +394,18 @@ async function cmdShip(dest, opts = {}) {
 
   const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
   const baseBranch = dest || branchBase(branch) || BASE_BRANCH;
+  const isFeature = branch.startsWith(prefix);
 
-  if (!branch.startsWith(prefix)) {
+  if (!isFeature) {
+    // Not a git-flow feature branch — ship it anyway with a plain push below
+    // instead of `git flow feature publish` (which requires the feature prefix).
+    console.log(`Note: '${branch}' is not a git-flow feature branch (${prefix}*) — shipping it anyway.`);
+  }
+
+  if (branch === baseBranch) {
     fail(
-      `Current branch '${branch}' is not a git-flow feature branch (${prefix}*).`,
-      'Check out your feature branch first, or start one with:',
-      `  ${PROG} start <name>`
+      `Current branch '${branch}' is also the PR target — nothing to ship.`,
+      `Pick a different destination, e.g. ${PROG} ship <dest>.`
     );
   }
 
@@ -407,7 +413,7 @@ async function cmdShip(dest, opts = {}) {
     fail('You have uncommitted changes. Commit or stash them before shipping.');
   }
 
-  const featureName = branch.slice(prefix.length);
+  const featureName = isFeature ? branch.slice(prefix.length) : '';
 
   // Drop stale remote-tracking refs (e.g. the branch was deleted on origin
   // when a previous PR merged). `git flow feature publish` checks local
@@ -435,9 +441,12 @@ async function cmdShip(dest, opts = {}) {
     // Branch already exists on origin — just push the latest commits.
     console.log('==> Branch already published, pushing latest commits...');
     run('git', ['push', 'origin', branch]);
-  } else {
+  } else if (isFeature) {
     console.log(`==> Publishing feature branch (git flow feature publish ${featureName})...`);
     run('git', ['flow', 'feature', 'publish', featureName]);
+  } else {
+    console.log(`==> Publishing branch (git push -u origin ${branch})...`);
+    run('git', ['push', '-u', 'origin', branch]);
   }
 
   if (useGh) {
@@ -481,7 +490,9 @@ function cmdMerge(strategy) {
     );
   }
   if (!branch.startsWith(prefix)) {
-    fail(`Current branch '${branch}' is not a git-flow feature branch (${prefix}*).`);
+    // Not a feature branch — merge its PR anyway (matches `ship`). `done`
+    // cleanup below skips the local branch delete for non-feature branches.
+    console.log(`Note: '${branch}' is not a git-flow feature branch (${prefix}*) — merging its PR anyway.`);
   }
   if (git(['status', '--porcelain']) !== '') {
     fail('You have uncommitted changes. Commit or stash them before merging.');

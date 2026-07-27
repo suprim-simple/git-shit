@@ -1,6 +1,6 @@
 {
   "name": "git-shit",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "git-flow feature workflow that ends in a PR into staging: publish the branch, then create and merge the PR from the terminal with the GitHub CLI (gh) — or fall back to opening the Bitbucket/GitHub PR page pre-filled and auto-clicking Create pull request.",
   "keywords": [
     "git",
