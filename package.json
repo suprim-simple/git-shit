@@ -18,6 +18,9 @@
   "bin": {
     "git-shit": "bin/git-shit.js"
   },
+  "scripts": {
+    "test": "node test/pr-body.test.js"
+  },
   "files": [
     "bin"
   ],
