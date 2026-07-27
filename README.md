@@ -1,5 +1,7 @@
 # git-shit
 
+[![CI](https://github.com/suprim-simple/git-shit/actions/workflows/ci.yml/badge.svg)](https://github.com/suprim-simple/git-shit/actions/workflows/ci.yml)
+
 git-flow feature workflow that ends in a pull request into `staging` — publish the branch, then create (and merge) the PR **straight from the terminal with the [GitHub CLI](https://cli.github.com)**. On Bitbucket, or without `gh`, it falls back to opening the pre-filled PR page in Chrome and auto-clicking **Create pull request**.
 
 `git flow feature finish` is deliberately not used: it merges locally and pushes directly. With `git-shit`, the merge into `staging` happens through a PR.
