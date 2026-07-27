@@ -371,6 +371,74 @@ function cmdStart(name, base) {
   console.log(`Do your work, commit, then run: ${PROG} ship`);
 }
 
+// --- PR title & body --------------------------------------------------------
+// A single-commit branch keeps its commit subject as the title and its full
+// message body as the PR body (the common case). A multi-commit branch uses
+// the first commit's subject as the title and a bullet list of every commit
+// subject as the body — a ready-made summary instead of just the tip commit.
+// If the repo has a pull-request template, that wins as the body so the team's
+// format/checklist is preserved (matching how `gh` itself treats templates).
+
+function prTemplate() {
+  let root;
+  try {
+    root = git(['rev-parse', '--show-toplevel']);
+  } catch {
+    return '';
+  }
+  // Common GitHub template locations — the first existing file wins.
+  const candidates = [
+    '.github/pull_request_template.md',
+    '.github/PULL_REQUEST_TEMPLATE.md',
+    '.github/pull_request_template.markdown',
+    'pull_request_template.md',
+    'PULL_REQUEST_TEMPLATE.md',
+    'docs/pull_request_template.md',
+    'docs/PULL_REQUEST_TEMPLATE.md',
+  ];
+  for (const rel of candidates) {
+    try {
+      const p = path.join(root, rel);
+      if (fs.statSync(p).isFile()) return fs.readFileSync(p, 'utf8').trim();
+    } catch {}
+  }
+  return '';
+}
+
+function prTitleBody(base, branch) {
+  // Subjects of the commits this branch adds on top of origin/<base>, oldest
+  // first. Empty if the range can't be resolved (e.g. no origin/<base> ref).
+  let subjects = [];
+  try {
+    const out = git(['log', '--reverse', '--pretty=format:%s', `origin/${base}..${branch}`]);
+    if (out) subjects = out.split('\n');
+  } catch {}
+
+  let title = subjects[0] || '';
+  if (!title) {
+    try {
+      title = git(['log', '-1', '--pretty=format:%s', branch]);
+    } catch {}
+  }
+
+  const template = prTemplate();
+  let body;
+  if (template) {
+    body = template;
+  } else if (subjects.length > 1) {
+    body = subjects.map((s) => `- ${s}`).join('\n');
+  } else {
+    // Single commit (or an unresolvable range): use its full message body.
+    try {
+      body = git(['log', '-1', '--pretty=format:%b', branch]).trim();
+    } catch {
+      body = '';
+    }
+  }
+
+  return { title: title || branch, body };
+}
+
 // Create the PR with `gh pr create` (or recognise the one already open).
 function shipViaGh(branch, baseBranch, draft) {
   const existing = ghJson(['pr', 'view', branch, '--json', 'number,url,state,isDraft']);
@@ -380,14 +448,7 @@ function shipViaGh(branch, baseBranch, draft) {
     );
     console.log(`    ${existing.url}`);
   } else {
-    let title = '';
-    let body = '';
-    try {
-      title = git(['log', '-1', '--pretty=%s']);
-    } catch {}
-    try {
-      body = git(['log', '-1', '--pretty=%b']);
-    } catch {}
+    const { title, body } = prTitleBody(baseBranch, branch);
 
     console.log(`==> Creating PR via gh: ${branch} -> ${baseBranch}${draft ? ' (draft)' : ''}`);
     const args = [
@@ -707,6 +768,11 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  fail(err && err.message ? err.message : String(err));
-});
+if (require.main === module) {
+  main().catch((err) => {
+    fail(err && err.message ? err.message : String(err));
+  });
+}
+
+// Exported for tests; the CLI entry point is the guarded main() above.
+module.exports = { prTitleBody, prTemplate, defaultBase };

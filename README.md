@@ -47,8 +47,18 @@ Runs `git flow feature start`. With `base`, the feature branches off `origin/<ba
 1. Verifies you have no uncommitted changes and that the destination branch (default: the base recorded by `start`, else `staging`) exists on `origin`. A `feature/*` branch is the normal case, but any branch can ship — off a `feature/*` branch it just prints a note and carries on (it only refuses to ship a branch into itself).
 2. Publishes the branch — `git flow feature publish` for a `feature/*` branch, a plain `git push -u origin <branch>` otherwise — or just pushes if it's already on `origin`.
 3. Creates the PR:
-   - **GitHub remote + `gh` logged in** — creates the PR from the terminal with `gh pr create`, title and body taken from your last commit. If the branch already has an open PR, it just tells you (the push already updated it). `--draft` opens it as a draft; `--web` skips `gh` and forces the browser flow.
+   - **GitHub remote + `gh` logged in** — creates the PR from the terminal with `gh pr create`. The title and body come from the branch's commits: a single-commit branch uses that commit's subject and full message body, while a multi-commit branch uses the first commit's subject as the title and a bullet list of every commit subject as the body. If the repo has a [pull-request template](#pr-title-and-body), it's used as the body instead. If the branch already has an open PR, it just tells you (the push already updated it). `--draft` opens it as a draft; `--web` skips `gh` and forces the browser flow.
    - **Bitbucket, or no `gh`** — opens the "new pull request" page in Chrome, pre-filled with source, destination, and title. On macOS it polls the active Chrome tab and auto-clicks **Create pull request** once it renders. Workspace/repo are auto-detected from `origin` (SSH or HTTPS).
+
+### PR title and body
+
+When creating a PR with `gh`, `git-shit` fills the title and body from the commits your branch adds on top of the base:
+
+- **One commit** — the title is its subject and the body is its full message body (the common case if you keep one commit per branch).
+- **Several commits** — the title is the **first** commit's subject and the body is a bullet list of every commit subject, oldest first — a ready-made summary rather than just the tip commit.
+- **Pull-request template** — if the repo has one (`.github/pull_request_template.md`, `PULL_REQUEST_TEMPLATE.md`, `docs/…`, and the usual variants), its contents become the body so your team's checklist/format is preserved; the title still comes from the commits.
+
+Either way it's just the starting point — edit the PR on GitHub afterwards if you want. (The Bitbucket/browser fallback only pre-fills the title.)
 
 ### `merge [--merge|--squash|--rebase]` (GitHub + gh)
 
