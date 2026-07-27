@@ -23,12 +23,15 @@
 //   Chrome menu bar -> View -> Developer -> Allow JavaScript from Apple Events
 //   (Without it, the tool still opens the PR page; you click Create yourself.)
 //
-// Requires: git, git-flow. Terminal PRs need the GitHub CLI (`gh`, logged in);
-//           the browser fallback needs macOS + Google Chrome for the auto-click.
+// Requires: git. Only `start` needs git-flow; ship/merge/done work without it.
+//           Terminal PRs need the GitHub CLI (`gh`, logged in); the browser
+//           fallback needs macOS + Google Chrome for the auto-click.
 //
 // Notes:
 //   - Workspace + repo slug are auto-detected from the `origin` remote URL.
-//   - Assumes git-flow is initialised (`git flow init`) with feature prefix "feature/".
+//   - If git-flow is initialised (`git flow init`, feature prefix "feature/"),
+//     ship publishes feature branches with `git flow feature publish`; without
+//     it, ship falls back to a plain `git push -u origin <branch>`.
 //   - `git flow feature finish` is deliberately NOT used: it merges locally and
 //     pushes directly — here the merge into staging happens through a PR.
 
@@ -86,6 +89,28 @@ function featurePrefix() {
   } catch {
     return 'feature/';
   }
+}
+
+// Has `git flow init` been run in this repo? It records these config keys, and
+// `git flow feature publish` needs them — without them the command errors out.
+// (featurePrefix() falls back to 'feature/' even when git-flow is absent, so a
+// branch can look like a feature branch in a repo that has no git-flow.)
+function gitflowInitialized() {
+  return (
+    spawnSync('git', ['config', '--get', 'gitflow.prefix.feature'], { stdio: 'ignore' }).status === 0
+  );
+}
+
+// How to publish the current branch to origin. `git flow feature publish` only
+// works in a git-flow-initialised repo; everywhere else a plain upstream push
+// is the equivalent, so `ship` works with or without git-flow.
+//   'push'          -> already on origin: push updates to it
+//   'flow'          -> git flow feature publish <name>
+//   'push-upstream' -> git push -u origin <branch>
+function publishPlan(onOrigin, isFeature, gitflowReady) {
+  if (onOrigin) return 'push';
+  if (isFeature && gitflowReady) return 'flow';
+  return 'push-upstream';
 }
 
 // Base recorded by `start <name> <base>` for this feature branch, if any.
@@ -524,14 +549,20 @@ async function cmdShip(dest, opts = {}) {
       stdio: 'ignore',
     }).status === 0;
 
-  if (onOrigin) {
+  const plan = publishPlan(onOrigin, isFeature, gitflowInitialized());
+  if (plan === 'push') {
     // Branch already exists on origin — just push the latest commits.
     console.log('==> Branch already published, pushing latest commits...');
     run('git', ['push', 'origin', branch]);
-  } else if (isFeature) {
+  } else if (plan === 'flow') {
     console.log(`==> Publishing feature branch (git flow feature publish ${featureName})...`);
     run('git', ['flow', 'feature', 'publish', featureName]);
   } else {
+    if (isFeature) {
+      // A feature-named branch in a repo without git-flow — publish it with a
+      // plain push instead of erroring on `git flow feature publish`.
+      console.log('    (git-flow not initialised here — publishing with a plain push)');
+    }
     console.log(`==> Publishing branch (git push -u origin ${branch})...`);
     run('git', ['push', '-u', 'origin', branch]);
   }
@@ -775,4 +806,4 @@ if (require.main === module) {
 }
 
 // Exported for tests; the CLI entry point is the guarded main() above.
-module.exports = { prTitleBody, prTemplate, defaultBase };
+module.exports = { prTitleBody, prTemplate, defaultBase, gitflowInitialized, publishPlan };
