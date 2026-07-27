@@ -32,7 +32,11 @@ git-shit ship --draft    # create the PR as a draft (GitHub + gh only)
 git-shit merge           # merge the open PR from the terminal, then clean up
 git-shit merge --squash  # same, squash-merged (also: --rebase)
 git-shit done            # cleanup only: checkout the base, pull, delete branch, prune
+git-shit help            # show usage (also --help, -h)
+git-shit version         # show version (also --version, -v)
 ```
+
+The default PR target is `staging`, but it's configurable — see [Configuration](#configuration).
 
 ### `start <name> [base]`
 
@@ -40,15 +44,15 @@ Runs `git flow feature start`. With `base`, the feature branches off `origin/<ba
 
 ### `ship [dest] [--draft] [--web]`
 
-1. Verifies you're on a `feature/*` branch with no uncommitted changes, and that the destination branch (default: the base recorded by `start`, else `staging`) exists on `origin`.
-2. Publishes the branch (`git flow feature publish`), or just pushes if it's already on `origin`.
+1. Verifies you have no uncommitted changes and that the destination branch (default: the base recorded by `start`, else `staging`) exists on `origin`. A `feature/*` branch is the normal case, but any branch can ship — off a `feature/*` branch it just prints a note and carries on (it only refuses to ship a branch into itself).
+2. Publishes the branch — `git flow feature publish` for a `feature/*` branch, a plain `git push -u origin <branch>` otherwise — or just pushes if it's already on `origin`.
 3. Creates the PR:
    - **GitHub remote + `gh` logged in** — creates the PR from the terminal with `gh pr create`, title and body taken from your last commit. If the branch already has an open PR, it just tells you (the push already updated it). `--draft` opens it as a draft; `--web` skips `gh` and forces the browser flow.
    - **Bitbucket, or no `gh`** — opens the "new pull request" page in Chrome, pre-filled with source, destination, and title. On macOS it polls the active Chrome tab and auto-clicks **Create pull request** once it renders. Workspace/repo are auto-detected from `origin` (SSH or HTTPS).
 
 ### `merge [--merge|--squash|--rebase]` (GitHub + gh)
 
-Merges the current feature's open PR with `gh pr merge` (default: a merge commit), then runs the `done` cleanup against the PR's actual base branch. Refuses if you have unpushed commits, if there's no open PR, or if the PR is still a draft. On Bitbucket, merge in the browser and run `git-shit done` instead.
+Merges the current branch's open PR with `gh pr merge` (default: a merge commit), then runs the `done` cleanup against the PR's actual base branch. Works on a `feature/*` branch or any other branch you shipped (off a `feature/*` branch it prints a note and the cleanup leaves the local branch in place). Refuses if you have unpushed commits, if there's no open PR, or if the PR is still a draft. On Bitbucket, merge in the browser and run `git-shit done` instead.
 
 ### `done [dest]`
 
@@ -57,6 +61,17 @@ Run after the PR is merged in the browser (`merge` does this for you). Checks ou
 ### `status`
 
 Shows the current branch, its recorded base (if not `staging`), whether it's clean, whether it's published to `origin`, unpushed commits, and ahead/behind counts vs the base. With `gh` on a GitHub remote it also shows the live PR state — number, open/draft/merged, review decision, mergeability, and URL.
+
+## Configuration
+
+The default PR target — used by `ship`, `merge`-cleanup, `done`, and `status` when a branch has no base recorded by `start` and you don't pass an explicit `dest` — is `staging`. Change it per-repo (or everywhere with `--global`):
+
+```sh
+git config gitshit.base develop          # this repo
+git config --global gitshit.base develop # all repos
+```
+
+Precedence, highest first: an explicit `dest` argument (`git-shit ship main`) → the base recorded on the branch by `git-shit start <name> <base>` → `gitshit.base` → the built-in default `staging`.
 
 ## Requirements
 
