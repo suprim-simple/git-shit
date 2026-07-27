@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['16', '18', '20', '22']
+    name: test (node ${{ matrix.node-version }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      # The test spins up throwaway git repos and commits into them, so it
+      # needs a git identity on the runner.
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@github-actions"
+          git config --global user.name "CI"
+
+      # No dependencies to install (git-shit is dependency-free), so run the
+      # test suite directly.
+      - run: npm test
