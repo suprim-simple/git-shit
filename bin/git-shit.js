@@ -41,6 +41,24 @@ const path = require('path');
 
 const BASE_BRANCH = 'staging';
 const PROG = 'git-shit';
+const { version: VERSION } = require('../package.json');
+
+// The default PR target when a branch has no base recorded by `start` and no
+// explicit dest is given. Overridable per-repo/globally with:
+//   git config gitshit.base develop
+// Falls back to BASE_BRANCH ('staging'). Memoised — the base can't change
+// within a single invocation.
+let defaultBaseCache = null;
+function defaultBase() {
+  if (defaultBaseCache === null) {
+    try {
+      defaultBaseCache = git(['config', 'gitshit.base']) || BASE_BRANCH;
+    } catch {
+      defaultBaseCache = BASE_BRANCH;
+    }
+  }
+  return defaultBaseCache;
+}
 
 function fail(...lines) {
   for (const line of lines) console.error(line);
@@ -109,8 +127,11 @@ function ghJson(args) {
   }
 }
 
-function usage() {
-  console.log(`Usage:
+function usage(exitCode = 1) {
+  const base = defaultBase();
+  console.log(`${PROG} ${VERSION}
+
+Usage:
   ${PROG} start <name> [base]
                          Start a new git-flow feature. With base, branch off
                          origin/<base> (e.g. production) instead of git-flow's
@@ -118,7 +139,7 @@ function usage() {
                          this branch.
   ${PROG} ship [dest] [--draft] [--web]
                          Push current feature and open a PR against dest
-                         (default: the branch's recorded base, else ${BASE_BRANCH}).
+                         (default: the branch's recorded base, else ${base}).
                          On GitHub with the gh CLI the
                          PR is created from the terminal (--draft for a draft
                          PR, --web to force the browser flow). Bitbucket or no
@@ -127,11 +148,16 @@ function usage() {
                          Merge the feature's open PR with gh (GitHub only,
                          default: --merge), then clean up like 'done'
   ${PROG} done [dest]    After the PR is merged: checkout dest (default: the
-                         branch's recorded base, else ${BASE_BRANCH}), pull, delete
+                         branch's recorded base, else ${base}), pull, delete
                          the local feature branch, prune stale refs
   ${PROG} status         Show branch, publish state, PR state, and commits
-                         vs the branch's base`);
-  process.exit(1);
+                         vs the branch's base
+  ${PROG} help           Show this help    (also --help, -h)
+  ${PROG} version        Show the version  (also --version, -v)
+
+The default PR target is '${base}'. Change it with:
+  git config gitshit.base <branch>       (add --global to set it everywhere)`);
+  process.exit(exitCode);
 }
 
 function resolveRepo() {
@@ -393,7 +419,7 @@ async function cmdShip(dest, opts = {}) {
   }
 
   const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
-  const baseBranch = dest || branchBase(branch) || BASE_BRANCH;
+  const baseBranch = dest || branchBase(branch) || defaultBase();
   const isFeature = branch.startsWith(prefix);
 
   if (!isFeature) {
@@ -428,7 +454,7 @@ async function cmdShip(dest, opts = {}) {
   if (!destOnOrigin) {
     fail(
       `Destination branch '${baseBranch}' does not exist on origin.`,
-      `Usage: ${PROG} ship [dest]   (default: ${BASE_BRANCH})`
+      `Usage: ${PROG} ship [dest]   (default: ${defaultBase()})`
     );
   }
 
@@ -467,7 +493,10 @@ async function cmdShip(dest, opts = {}) {
 
   console.log('');
   console.log('After merging in the browser, clean up locally with:');
-  console.log(`  ${PROG} done${baseBranch === BASE_BRANCH ? '' : ` ${baseBranch}`}`);
+  // `done` with no arg resolves the base the same way (recorded base, else the
+  // configured default) — only spell out dest when it differs from that.
+  const doneDefault = branchBase(branch) || defaultBase();
+  console.log(`  ${PROG} done${baseBranch === doneDefault ? '' : ` ${baseBranch}`}`);
 }
 
 // Merge the current feature's open PR with gh, then clean up like `done`.
@@ -538,7 +567,7 @@ function cmdMerge(strategy) {
 function cmdDone(dest) {
   const prefix = featurePrefix();
   const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
-  const baseBranch = dest || branchBase(branch) || BASE_BRANCH;
+  const baseBranch = dest || branchBase(branch) || defaultBase();
 
   if (git(['status', '--porcelain']) !== '') {
     fail('You have uncommitted changes. Commit or stash them before cleaning up.');
@@ -578,10 +607,10 @@ function cmdStatus() {
   const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
   const isFeature = branch.startsWith(prefix);
   const dirty = git(['status', '--porcelain']) !== '';
-  const base = branchBase(branch) || BASE_BRANCH;
+  const base = branchBase(branch) || defaultBase();
 
   console.log(`Branch:     ${branch}${isFeature ? '' : `  (not a ${prefix}* branch)`}`);
-  if (base !== BASE_BRANCH) {
+  if (base !== defaultBase()) {
     console.log(`Base:       ${base} (recorded by '${PROG} start')`);
   }
   console.log(`Changes:    ${dirty ? 'uncommitted changes present' : 'clean'}`);
@@ -633,6 +662,14 @@ async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   const flags = rest.filter((a) => a.startsWith('--'));
   const pos = rest.filter((a) => !a.startsWith('--'));
+
+  if (cmd === 'version' || cmd === '--version' || cmd === '-v') {
+    console.log(VERSION);
+    return;
+  }
+  if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
+    usage(0);
+  }
 
   switch (cmd) {
     case 'start':
