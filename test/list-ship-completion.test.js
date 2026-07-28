@@ -8,10 +8,15 @@ const {
   splitList,
   uniq,
   prCreateArgs,
+  tallyChecks,
   checksSummary,
   reviewSummary,
   prCellText,
+  isStackedBase,
+  stackDepth,
+  stackOrder,
   buildListRows,
+  branchLabel,
   renderList,
   completionBash,
   completionZsh,
@@ -83,6 +88,15 @@ eq('checks: pending shows passed/total',
 eq('checks: StatusContext uses .state',
   checksSummary([{ state: 'SUCCESS' }, { state: 'PENDING' }]), 'checks: 1/2');
 
+// --- tallyChecks (backs both the summary and `merge --when-green`) ----------
+eq('tally: none', tallyChecks([]), { pass: 0, fail: 0, pending: 0, total: 0 });
+eq('tally: not an array', tallyChecks(undefined), { pass: 0, fail: 0, pending: 0, total: 0 });
+eq('tally: mixed conclusions',
+  tallyChecks([{ conclusion: 'SUCCESS' }, { conclusion: 'SKIPPED' }, { conclusion: 'FAILURE' }, { status: 'IN_PROGRESS' }]),
+  { pass: 2, fail: 1, pending: 1, total: 4 });
+eq('tally: StatusContext state', tallyChecks([{ state: 'SUCCESS' }, { state: 'PENDING' }]),
+  { pass: 1, fail: 0, pending: 1, total: 2 });
+
 // --- reviewSummary ----------------------------------------------------------
 eq('review: approved', reviewSummary('APPROVED'), 'approved');
 eq('review: changes requested', reviewSummary('CHANGES_REQUESTED'), 'changes requested');
@@ -120,6 +134,48 @@ const lines = renderList(rows);
 ok('render: has a header row', /^\s+BRANCH\s+BASE\s+STATE\s+PR$/.test(lines[0]));
 ok('render: marks current branch line with *', lines[1].startsWith('* feature/a'));
 ok('render: columns are padded to align', lines[1].indexOf('main') === lines[2].indexOf('staging'));
+
+// --- stacking: isStackedBase / stackDepth / stackOrder / branchLabel --------
+ok('stacked: a feature-prefixed base is a stack parent', isStackedBase('feature/a', 'feature/'));
+ok('stacked: a long-lived base is not', !isStackedBase('staging', 'feature/'));
+ok('stacked: empty base is not', !isStackedBase('', 'feature/'));
+
+// feature/c -> feature/b -> feature/a -> staging  (a chain two deep)
+const chain = ['feature/a', 'feature/b', 'feature/c'];
+const chainBase = { 'feature/a': 'staging', 'feature/b': 'feature/a', 'feature/c': 'feature/b' };
+const chainSet = new Set(chain);
+const effOf = (b) => chainBase[b];
+eq('depth: root of a stack is 0', stackDepth('feature/a', chainSet, effOf), 0);
+eq('depth: child is 1', stackDepth('feature/b', chainSet, effOf), 1);
+eq('depth: grandchild is 2', stackDepth('feature/c', chainSet, effOf), 2);
+eq('depth: base outside the set stays 0',
+  stackDepth('feature/x', new Set(['feature/x']), () => 'staging'), 0);
+
+// Children follow their parent even when input order is shuffled by date.
+eq('order: children slot under parents',
+  stackOrder(['feature/c', 'feature/a', 'feature/b'], effOf),
+  ['feature/a', 'feature/b', 'feature/c']);
+eq('order: independent roots keep their input order',
+  stackOrder(['feature/z', 'feature/y'], () => 'staging'),
+  ['feature/z', 'feature/y']);
+
+eq('label: root branch is not indented', branchLabel({ branch: 'feature/a', depth: 0 }), 'feature/a');
+ok('label: stacked child gets a tree glyph', branchLabel({ branch: 'feature/b', depth: 1 }).includes('feature/b'));
+ok('label: deeper child is indented further',
+  branchLabel({ branch: 'feature/c', depth: 2 }).length > branchLabel({ branch: 'feature/b', depth: 1 }).length);
+
+// buildListRows carries depth from the effective base (PR target wins).
+const stackRows = buildListRows({
+  branches: ['feature/a', 'feature/b'],
+  current: 'feature/b',
+  remoteHeads: new Set(['feature/a', 'feature/b']),
+  prByBranch: { 'feature/b': { number: 9, state: 'OPEN', isDraft: false, baseRefName: 'feature/a', statusCheckRollup: [], reviewDecision: null } },
+  baseOf: () => 'staging',
+  ghAvailable: true,
+});
+eq('rows: stacked child reports depth 1', stackRows[1].depth, 1);
+eq('rows: stack parent reports depth 0', stackRows[0].depth, 0);
+eq('rows: child base column shows the parent', stackRows[1].base, 'feature/a');
 
 // --- completion generators --------------------------------------------------
 for (const [shell, gen] of [['bash', completionBash], ['zsh', completionZsh], ['fish', completionFish]]) {
