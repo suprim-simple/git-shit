@@ -28,6 +28,8 @@ git-shit start my-fix             # runs `git flow feature start my-fix`
 git-shit start my-fix production  # same, but branch off origin/production
 # ...do your work, commit as usual...
 git-shit status          # where am I? published? PR state? ahead/behind the base?
+git-shit sync            # catch the branch up to its base (rebase origin/staging in)
+git-shit sync --merge    # same, but merge the base in instead of rebasing
 git-shit ship            # pushes the branch and opens a PR into the base (default: staging)
 git-shit ship develop    # same, but the PR targets `develop` instead
 git-shit ship --draft    # create the PR as a draft (GitHub + gh only)
@@ -61,6 +63,17 @@ When creating a PR with `gh`, `git-shit` fills the title and body from the commi
 - **Pull-request template** — if the repo has one (`.github/pull_request_template.md`, `PULL_REQUEST_TEMPLATE.md`, `docs/…`, and the usual variants), its contents become the body so your team's checklist/format is preserved; the title still comes from the commits.
 
 Either way it's just the starting point — edit the PR on GitHub afterwards if you want. (The Bitbucket/browser fallback only pre-fills the title.)
+
+### `sync [dest] [--merge]`
+
+Brings the latest base into the current branch so it doesn't drift behind while you work (`status` tells you *how far* behind; `sync` is how you catch up). It:
+
+1. Refuses if you have uncommitted changes — a rebase/merge needs a clean tree.
+2. Fetches and prunes `origin`, then checks the base (default: the base recorded by `start`, else `staging`) exists there.
+3. If the base has no new commits, says so and stops without touching your tree.
+4. Otherwise **rebases** your branch onto `origin/<base>` — or **merges** the base in with `--merge`. On conflicts it leaves the in-progress rebase/merge in place and prints exactly how to continue (`git rebase --continue`) or back out (`git rebase --abort`).
+
+If the branch is already published, `sync` reminds you to update the open PR: a rebase rewrote history, so it needs `git push --force-with-lease origin <branch>`; a merge only adds a commit, so a plain `git-shit ship` is enough.
 
 ### `merge [--merge|--squash|--rebase]` (GitHub + gh)
 
