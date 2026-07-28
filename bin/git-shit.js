@@ -34,6 +34,8 @@
 //     it, ship falls back to a plain `git push -u origin <branch>`.
 //   - `git flow feature finish` is deliberately NOT used: it merges locally and
 //     pushes directly — here the merge into staging happens through a PR.
+//   - `git-shit sync` rebases (or --merge) the latest origin/<base> into the
+//     current branch so it stays current before or after the PR is opened.
 
 'use strict';
 
@@ -169,6 +171,10 @@ Usage:
                          PR is created from the terminal (--draft for a draft
                          PR, --web to force the browser flow). Bitbucket or no
                          gh: opens the PR page in Chrome and auto-clicks Create.
+  ${PROG} sync [dest] [--merge]
+                         Catch the current branch up to its base: fetch, then
+                         rebase (or --merge) origin/<base> into it (default:
+                         the branch's recorded base, else ${base}).
   ${PROG} merge [--merge|--squash|--rebase]
                          Merge the feature's open PR with gh (GitHub only,
                          default: --merge), then clean up like 'done'
@@ -591,6 +597,102 @@ async function cmdShip(dest, opts = {}) {
   console.log(`  ${PROG} done${baseBranch === doneDefault ? '' : ` ${baseBranch}`}`);
 }
 
+// Bring the latest base into the current branch: fetch, then rebase (default)
+// or merge origin/<base>. `status` reports when a branch has fallen behind its
+// base; `sync` is how you catch it back up before (or after) opening the PR.
+function cmdSync(dest, opts = {}) {
+  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
+  const baseBranch = dest || branchBase(branch) || defaultBase();
+  const strategy = opts.merge ? 'merge' : 'rebase';
+
+  if (branch === baseBranch) {
+    fail(
+      `Current branch '${branch}' is its own base — nothing to sync.`,
+      'Switch to your feature branch first.'
+    );
+  }
+
+  if (git(['status', '--porcelain']) !== '') {
+    fail(
+      'You have uncommitted changes. Commit or stash them before syncing.',
+      `(a ${strategy} needs a clean working tree)`
+    );
+  }
+
+  console.log('==> git fetch --prune origin');
+  run('git', ['fetch', '--prune', 'origin']);
+
+  const baseOnOrigin =
+    spawnSync('git', ['show-ref', '--verify', '--quiet', `refs/remotes/origin/${baseBranch}`], {
+      stdio: 'ignore',
+    }).status === 0;
+  if (!baseOnOrigin) {
+    fail(
+      `Base branch '${baseBranch}' does not exist on origin.`,
+      `Usage: ${PROG} sync [dest]   (default: ${defaultBase()})`
+    );
+  }
+
+  // How many commits is the base ahead of us? If none, there's nothing to pull
+  // in — say so and stop before touching the working tree.
+  let behind = '0';
+  try {
+    behind = git(['rev-list', '--count', `HEAD..origin/${baseBranch}`]);
+  } catch {}
+  if (behind === '0') {
+    console.log(`Already up to date with origin/${baseBranch}.`);
+    return;
+  }
+
+  const plural = behind === '1' ? '' : 's';
+  console.log(
+    strategy === 'rebase'
+      ? `==> Rebasing '${branch}' onto origin/${baseBranch} (${behind} new commit${plural})...`
+      : `==> Merging origin/${baseBranch} into '${branch}' (${behind} new commit${plural})...`
+  );
+
+  const r = spawnSync('git', [strategy, `origin/${baseBranch}`], { stdio: 'inherit' });
+  if (r.error && r.error.code === 'ENOENT') fail('git: command not found');
+  if (r.status !== 0) {
+    // Conflicts (or another failure) — leave the in-progress state in place and
+    // tell the user how to finish or back out. Don't exit 0 on a broken tree.
+    console.error('');
+    if (strategy === 'rebase') {
+      fail(
+        'The rebase stopped on conflicts. Resolve them, then continue with:',
+        '  git add <files> && git rebase --continue',
+        'Or back out and return to where you were:',
+        '  git rebase --abort'
+      );
+    }
+    fail(
+      'The merge stopped on conflicts. Resolve them, then commit with:',
+      '  git add <files> && git commit',
+      'Or back out and return to where you were:',
+      '  git merge --abort'
+    );
+  }
+
+  console.log('');
+  console.log(`Synced '${branch}' with origin/${baseBranch}.`);
+
+  // If the branch is already published, its PR needs updating. A rebase rewrote
+  // history, so origin can't fast-forward — that needs a lease-guarded force
+  // push. A merge only adds a commit, so a normal `ship` push is enough.
+  const onOrigin =
+    spawnSync('git', ['ls-remote', '--exit-code', '--heads', 'origin', branch], {
+      stdio: 'ignore',
+    }).status === 0;
+  if (onOrigin) {
+    if (strategy === 'rebase') {
+      console.log('History changed by the rebase — update the open PR with a force push:');
+      console.log(`  git push --force-with-lease origin ${branch}`);
+    } else {
+      console.log(`Push the merge to update the open PR with: ${PROG} ship`);
+    }
+  }
+}
+
 // Merge the current feature's open PR with gh, then clean up like `done`.
 function cmdMerge(strategy) {
   const repo = resolveRepo();
@@ -775,6 +877,17 @@ async function main() {
         draft: flags.includes('--draft'),
         web: flags.includes('--web'),
       });
+      break;
+    }
+    case 'sync': {
+      const known = ['--merge', '--rebase'];
+      for (const f of flags) {
+        if (!known.includes(f)) fail(`Unknown flag for sync: ${f}`);
+      }
+      if (flags.includes('--merge') && flags.includes('--rebase')) {
+        fail('Pick one of --merge, --rebase.');
+      }
+      cmdSync(pos[0], { merge: flags.includes('--merge') });
       break;
     }
     case 'merge': {
