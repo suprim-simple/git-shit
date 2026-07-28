@@ -36,6 +36,8 @@ git-shit ship --draft    # create the PR as a draft (GitHub + gh only)
 git-shit merge           # merge the open PR from the terminal, then clean up
 git-shit merge --squash  # same, squash-merged (also: --rebase)
 git-shit done            # cleanup only: checkout the base, pull, delete branch, prune
+git-shit list            # dashboard of every feature/* branch + its PR/checks/review
+git-shit completion zsh  # print a shell-completion script (also: bash, fish)
 git-shit help            # show usage (also --help, -h)
 git-shit version         # show version (also --version, -v)
 ```
@@ -46,13 +48,15 @@ The default PR target is `staging`, but it's configurable — see [Configuration
 
 Runs `git flow feature start`. With `base`, the feature branches off `origin/<base>` (freshly fetched) instead of git-flow's default `develop` — e.g. `git-shit start my-fix production` for a fix that belongs on `production`. The base is remembered on the branch, so `ship`, `merge`-cleanup, `done`, and `status` all use it as this branch's default PR target instead of `staging` (an explicit argument still wins, e.g. `git-shit ship develop`).
 
-### `ship [dest] [--draft] [--web]`
+### `ship [dest] [--draft] [--web] [--reviewer=…] [--label=…] [--assignee=…]`
 
 1. Verifies you have no uncommitted changes and that the destination branch (default: the base recorded by `start`, else `staging`) exists on `origin`. A `feature/*` branch is the normal case, but any branch can ship — off a `feature/*` branch it just prints a note and carries on (it only refuses to ship a branch into itself).
 2. Publishes the branch — `git flow feature publish` for a `feature/*` branch in a git-flow-initialised repo, otherwise a plain `git push -u origin <branch>` — or just pushes if it's already on `origin`. So `ship` works even in a repo where you never ran `git flow init` (a `feature/*` branch there is just published with a plain push).
 3. Creates the PR:
    - **GitHub remote + `gh` logged in** — creates the PR from the terminal with `gh pr create`. The title and body come from the branch's commits: a single-commit branch uses that commit's subject and full message body, while a multi-commit branch uses the first commit's subject as the title and a bullet list of every commit subject as the body. If the repo has a [pull-request template](#pr-title-and-body), it's used as the body instead. If the branch already has an open PR, it just tells you (the push already updated it). `--draft` opens it as a draft; `--web` skips `gh` and forces the browser flow.
    - **Bitbucket, or no `gh`** — opens the "new pull request" page in Chrome, pre-filled with source, destination, and title. On macOS it polls the active Chrome tab and auto-clicks **Create pull request** once it renders. Workspace/repo are auto-detected from `origin` (SSH or HTTPS).
+
+**Reviewers, labels, and assignees** (GitHub + `gh`, on PR creation): pass `--reviewer=alice,bob`, `--label=feature,needs-qa`, or `--assignee=@me` (comma-separated, use the `=` form). Each is unioned with a per-repo default from git config — set `gitshit.reviewers`, `gitshit.labels`, and `gitshit.assignees` once and every PR gets them for free (see [Configuration](#configuration)). They only apply when a new PR is created, and are ignored (with a note) in the Bitbucket/browser flow.
 
 ### PR title and body
 
@@ -87,6 +91,32 @@ Run after the PR is merged in the browser (`merge` does this for you). Checks ou
 
 Shows the current branch, its recorded base (if not `staging`), whether it's clean, whether it's published to `origin`, unpushed commits, and ahead/behind counts vs the base. With `gh` on a GitHub remote it also shows the live PR state — number, open/draft/merged, review decision, mergeability, and URL.
 
+### `list`
+
+A dashboard of **all** your in-flight work — every local `feature/*` branch at once, most-recently-worked first, instead of one branch at a time. For each it shows the base, publish state, and (with `gh` on a GitHub remote) the live PR state — number, open/draft/merged, a check-run summary (`checks: ok`, `checks: 2/3`, or `checks: 1 failing`), and the review decision. The current branch is marked with `*`. When a branch has an open/merged PR, the base column reflects the PR's actual target; otherwise it's the base `ship` would use.
+
+```
+  BRANCH                 BASE     STATE       PR
+* feature/new-nav        main     published   #42 · open · checks: 2/3 · review pending
+  feature/fix-login      staging  published   #41 · open · checks: ok · approved
+  feature/spike          develop  local only  —
+```
+
+One `git ls-remote` (publish state) and one `gh pr list` (PR state) back the whole table, so it stays fast even with many branches. On Bitbucket, or without `gh`, the PR columns are omitted.
+
+### `completion <bash|zsh|fish>`
+
+Prints a shell-completion script for `git-shit` to stdout — completes subcommands and their flags. Load it from your shell config:
+
+```sh
+# bash — in ~/.bashrc
+source <(git-shit completion bash)
+# zsh — in ~/.zshrc (after compinit)
+source <(git-shit completion zsh)
+# fish
+git-shit completion fish > ~/.config/fish/completions/git-shit.fish
+```
+
 ## Configuration
 
 The default PR target — used by `ship`, `merge`-cleanup, `done`, and `status` when a branch has no base recorded by `start` and you don't pass an explicit `dest` — is `staging`. Change it per-repo (or everywhere with `--global`):
@@ -97,6 +127,16 @@ git config --global gitshit.base develop # all repos
 ```
 
 Precedence, highest first: an explicit `dest` argument (`git-shit ship main`) → the base recorded on the branch by `git-shit start <name> <base>` → `gitshit.base` → the built-in default `staging`.
+
+### Default reviewers, labels, and assignees
+
+Set defaults that `ship` applies to every new PR (GitHub + `gh`). Values are comma-separated; any `--reviewer=`/`--label=`/`--assignee=` flag on a given `ship` is unioned in on top.
+
+```sh
+git config gitshit.reviewers alice,bob
+git config gitshit.labels    feature,needs-qa
+git config gitshit.assignees @me
+```
 
 ## Requirements
 
