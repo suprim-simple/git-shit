@@ -36,6 +36,8 @@
 //     pushes directly — here the merge into staging happens through a PR.
 //   - `git-shit sync` rebases (or --merge) the latest origin/<base> into the
 //     current branch so it stays current before or after the PR is opened.
+//   - `git-shit list` is a dashboard of every feature/* branch and its live PR
+//     state; `git-shit completion <bash|zsh|fish>` prints a completion script.
 
 'use strict';
 
@@ -47,6 +49,26 @@ const path = require('path');
 const BASE_BRANCH = 'staging';
 const PROG = 'git-shit';
 const { version: VERSION } = require('../package.json');
+
+// Subcommands and their flags — the single source the shell-completion scripts
+// are generated from, so completions never drift from what the CLI accepts.
+const COMMANDS = [
+  { name: 'start', desc: 'Start a new git-flow feature' },
+  { name: 'ship', desc: 'Push the branch and open a PR' },
+  { name: 'sync', desc: 'Catch the branch up to its base' },
+  { name: 'merge', desc: 'Merge the open PR, then clean up' },
+  { name: 'done', desc: 'Clean up after the PR is merged' },
+  { name: 'status', desc: 'Show branch, publish, and PR state' },
+  { name: 'list', desc: 'List feature branches and their PRs' },
+  { name: 'completion', desc: 'Print a shell-completion script' },
+  { name: 'help', desc: 'Show help' },
+  { name: 'version', desc: 'Show the version' },
+];
+const FLAGS = {
+  ship: ['--draft', '--web', '--reviewer=', '--label=', '--assignee='],
+  sync: ['--merge', '--rebase'],
+  merge: ['--merge', '--squash', '--rebase'],
+};
 
 // The default PR target when a branch has no base recorded by `start` and no
 // explicit dest is given. Overridable per-repo/globally with:
@@ -72,6 +94,28 @@ function fail(...lines) {
 
 function git(args) {
   return execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+}
+
+// Split a comma-separated (or comma+space) value into trimmed, non-empty items.
+function splitList(value) {
+  return String(value || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+// De-duplicate a list, preserving first-seen order.
+function uniq(items) {
+  return items.filter((v, i) => items.indexOf(v) === i);
+}
+
+// A multi-valued git config read (comma-separated), e.g. gitshit.reviewers.
+function configList(key) {
+  try {
+    return splitList(git(['config', key]));
+  } catch {
+    return [];
+  }
 }
 
 // Run a command with output streamed to the terminal; exit on failure.
@@ -165,12 +209,15 @@ Usage:
                          develop, and make <base> the default PR target for
                          this branch.
   ${PROG} ship [dest] [--draft] [--web]
+       [--reviewer=a,b] [--label=x] [--assignee=@me]
                          Push current feature and open a PR against dest
                          (default: the branch's recorded base, else ${base}).
                          On GitHub with the gh CLI the
                          PR is created from the terminal (--draft for a draft
                          PR, --web to force the browser flow). Bitbucket or no
                          gh: opens the PR page in Chrome and auto-clicks Create.
+                         Reviewers/labels/assignees also come from git config
+                         (gitshit.reviewers/labels/assignees).
   ${PROG} sync [dest] [--merge]
                          Catch the current branch up to its base: fetch, then
                          rebase (or --merge) origin/<base> into it (default:
@@ -183,6 +230,10 @@ Usage:
                          the local feature branch, prune stale refs
   ${PROG} status         Show branch, publish state, PR state, and commits
                          vs the branch's base
+  ${PROG} list           Dashboard of every ${featurePrefix()}* branch: base,
+                         publish state, and live PR/checks/review state
+  ${PROG} completion <bash|zsh|fish>
+                         Print a shell-completion script for the given shell
   ${PROG} help           Show this help    (also --help, -h)
   ${PROG} version        Show the version  (also --version, -v)
 
@@ -191,29 +242,37 @@ The default PR target is '${base}'. Change it with:
   process.exit(exitCode);
 }
 
+// Parse workspace/repo from an origin remote URL; null if it isn't a
+// recognised bitbucket/github URL. Handles:
+//   git@bitbucket.org:workspace/repo.git
+//   https://user@bitbucket.org/workspace/repo.git
+//   git@github.com:owner/repo.git
+//   https://github.com/owner/repo.git
+function parseRepo(remoteUrl) {
+  const m = (remoteUrl || '').match(/(bitbucket\.org|github\.com)[:/]([^/]+)\/([^/]+)$/);
+  if (!m) return null;
+  const host = m[1] === 'github.com' ? 'github' : 'bitbucket';
+  const workspace = m[2];
+  const repoSlug = m[3].replace(/\.git$/, '');
+  return { host, web: `https://${m[1]}/${workspace}/${repoSlug}` };
+}
+
+// The origin remote as {host, web}; exits with guidance if it can't be parsed.
+// `list` uses parseRepo directly so it can degrade instead of aborting.
 function resolveRepo() {
-  // Parse workspace/repo from the origin remote. Handles:
-  //   git@bitbucket.org:workspace/repo.git
-  //   https://user@bitbucket.org/workspace/repo.git
-  //   git@github.com:owner/repo.git
-  //   https://github.com/owner/repo.git
   let remoteUrl = '';
   try {
     remoteUrl = git(['remote', 'get-url', 'origin']);
   } catch {}
-
-  const m = remoteUrl.match(/(bitbucket\.org|github\.com)[:/]([^/]+)\/([^/]+)$/);
-  if (!m) {
+  const repo = parseRepo(remoteUrl);
+  if (!repo) {
     fail(
       'Could not determine workspace/repo from the origin remote',
       '(expected a bitbucket.org or github.com URL):',
       `  ${remoteUrl || '<no origin remote found>'}`
     );
   }
-  const host = m[1] === 'github.com' ? 'github' : 'bitbucket';
-  const workspace = m[2];
-  const repoSlug = m[3].replace(/\.git$/, '');
-  return { host, web: `https://${m[1]}/${workspace}/${repoSlug}` };
+  return repo;
 }
 
 // Build the "new PR" URL, pre-filling the title from the last commit subject.
@@ -470,8 +529,35 @@ function prTitleBody(base, branch) {
   return { title: title || branch, body };
 }
 
+// Build the `gh pr create` argument list. Reviewers/labels/assignees are each
+// passed as repeated flags (gh accepts one value per flag).
+function prCreateArgs({ base, head, title, body, draft, reviewers = [], labels = [], assignees = [] }) {
+  const args = [
+    'pr', 'create',
+    '--base', base,
+    '--head', head,
+    '--title', title || head,
+    '--body', body || '',
+  ];
+  if (draft) args.push('--draft');
+  for (const r of reviewers) args.push('--reviewer', r);
+  for (const l of labels) args.push('--label', l);
+  for (const a of assignees) args.push('--assignee', a);
+  return args;
+}
+
+// Reviewers/labels/assignees for a new PR: git-config defaults unioned with any
+// --reviewer=/--label=/--assignee= flags passed to `ship`.
+function prPeople(opts) {
+  return {
+    reviewers: uniq([...configList('gitshit.reviewers'), ...(opts.reviewers || [])]),
+    labels: uniq([...configList('gitshit.labels'), ...(opts.labels || [])]),
+    assignees: uniq([...configList('gitshit.assignees'), ...(opts.assignees || [])]),
+  };
+}
+
 // Create the PR with `gh pr create` (or recognise the one already open).
-function shipViaGh(branch, baseBranch, draft) {
+function shipViaGh(branch, baseBranch, opts = {}) {
   const existing = ghJson(['pr', 'view', branch, '--json', 'number,url,state,isDraft']);
   if (existing && existing.state === 'OPEN') {
     console.log(
@@ -480,17 +566,22 @@ function shipViaGh(branch, baseBranch, draft) {
     console.log(`    ${existing.url}`);
   } else {
     const { title, body } = prTitleBody(baseBranch, branch);
+    const { reviewers, labels, assignees } = prPeople(opts);
 
-    console.log(`==> Creating PR via gh: ${branch} -> ${baseBranch}${draft ? ' (draft)' : ''}`);
-    const args = [
-      'pr', 'create',
-      '--base', baseBranch,
-      '--head', branch,
-      '--title', title || branch,
-      '--body', body,
-    ];
-    if (draft) args.push('--draft');
-    run('gh', args);
+    console.log(`==> Creating PR via gh: ${branch} -> ${baseBranch}${opts.draft ? ' (draft)' : ''}`);
+    if (reviewers.length) console.log(`    reviewers: ${reviewers.join(', ')}`);
+    if (labels.length) console.log(`    labels: ${labels.join(', ')}`);
+    if (assignees.length) console.log(`    assignees: ${assignees.join(', ')}`);
+    run('gh', prCreateArgs({
+      base: baseBranch,
+      head: branch,
+      title: title || branch,
+      body,
+      draft: opts.draft,
+      reviewers,
+      labels,
+      assignees,
+    }));
   }
 
   console.log('');
@@ -508,6 +599,9 @@ async function cmdShip(dest, opts = {}) {
       '--draft requires a GitHub remote with the gh CLI installed and logged in',
       '(https://cli.github.com), and cannot be combined with --web.'
     );
+  }
+  if (!useGh && ((opts.reviewers || []).length || (opts.labels || []).length || (opts.assignees || []).length)) {
+    console.log('Note: --reviewer/--label/--assignee need the gh CLI (GitHub) — ignored in the browser flow.');
   }
 
   const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
@@ -574,7 +668,7 @@ async function cmdShip(dest, opts = {}) {
   }
 
   if (useGh) {
-    shipViaGh(branch, baseBranch, opts.draft);
+    shipViaGh(branch, baseBranch, opts);
     return;
   }
 
@@ -852,6 +946,234 @@ function cmdStatus() {
   }
 }
 
+// --- list: a dashboard of every feature branch ------------------------------
+// Pure formatting helpers (below) are unit-tested; cmdList only gathers the
+// live data (branches, origin heads, open PRs) and hands it to them.
+
+// One-line summary of a PR's check runs, or '' if there are none.
+function checksSummary(rollup) {
+  if (!Array.isArray(rollup) || rollup.length === 0) return '';
+  let pass = 0;
+  let fail = 0;
+  let pending = 0;
+  for (const c of rollup) {
+    const s = String(c.conclusion || c.state || '').toUpperCase();
+    if (s === 'SUCCESS' || s === 'NEUTRAL' || s === 'SKIPPED') pass++;
+    else if (['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE'].includes(s)) fail++;
+    else pending++;
+  }
+  if (fail) return `checks: ${fail} failing`;
+  if (pending) return `checks: ${pass}/${rollup.length}`;
+  return 'checks: ok';
+}
+
+// Short label for gh's reviewDecision, or '' when there's no decision yet.
+function reviewSummary(decision) {
+  switch (decision) {
+    case 'APPROVED':
+      return 'approved';
+    case 'CHANGES_REQUESTED':
+      return 'changes requested';
+    case 'REVIEW_REQUIRED':
+      return 'review pending';
+    default:
+      return '';
+  }
+}
+
+// The PR column for one branch: '#12 open · checks: 2/3 · review pending', or
+// 'no PR' / '—' when gh is available and there's none, or '' when we can't tell
+// (Bitbucket, or gh not logged in).
+function prCellText(pr, published, ghAvailable) {
+  if (pr) {
+    const bits = [`#${pr.number}`, pr.isDraft ? 'draft' : String(pr.state).toLowerCase()];
+    const checks = checksSummary(pr.statusCheckRollup);
+    if (checks) bits.push(checks);
+    const review = reviewSummary(pr.reviewDecision);
+    if (review) bits.push(review);
+    return bits.join(' · ');
+  }
+  if (!ghAvailable) return '';
+  return published ? 'no PR' : '—';
+}
+
+// Turn the gathered primitives into display rows (one per branch). When a PR
+// exists its real target wins the BASE column; otherwise it's the branch's
+// recorded/default base (what `ship` would target).
+function buildListRows({ branches, current, remoteHeads, prByBranch, baseOf, ghAvailable }) {
+  return branches.map((b) => {
+    const published = remoteHeads.has(b);
+    const pr = prByBranch[b];
+    return {
+      mark: b === current ? '*' : ' ',
+      branch: b,
+      base: (pr && pr.baseRefName) || baseOf(b),
+      state: published ? 'published' : 'local only',
+      pr: prCellText(pr, published, ghAvailable),
+    };
+  });
+}
+
+// Render rows as an aligned table (header + one line per row).
+function renderList(rows) {
+  const width = (key, head) => Math.max(head.length, ...rows.map((r) => r[key].length));
+  const bw = width('branch', 'BRANCH');
+  const baw = width('base', 'BASE');
+  const sw = width('state', 'STATE');
+  const lines = [`  ${'BRANCH'.padEnd(bw)}  ${'BASE'.padEnd(baw)}  ${'STATE'.padEnd(sw)}  PR`];
+  for (const r of rows) {
+    lines.push(`${r.mark} ${r.branch.padEnd(bw)}  ${r.base.padEnd(baw)}  ${r.state.padEnd(sw)}  ${r.pr}`.trimEnd());
+  }
+  return lines;
+}
+
+function cmdList() {
+  const prefix = featurePrefix();
+  const current = git(['rev-parse', '--abbrev-ref', 'HEAD']);
+
+  // Every local branch under the feature prefix, most-recently-committed first.
+  const branches = git([
+    'for-each-ref', '--sort=-committerdate', '--format=%(refname:short)', `refs/heads/${prefix}`,
+  ])
+    .split('\n')
+    .filter(Boolean);
+
+  if (!branches.length) {
+    console.log(`No ${prefix}* branches yet. Start one with: ${PROG} start <name>`);
+    return;
+  }
+
+  // Published state: one ls-remote gives the authoritative set of origin heads.
+  const remoteHeads = new Set();
+  const ls = spawnSync('git', ['ls-remote', '--heads', 'origin'], { encoding: 'utf8' });
+  if (ls.status === 0) {
+    for (const line of (ls.stdout || '').split('\n')) {
+      const m = line.match(/\trefs\/heads\/(.+)$/);
+      if (m) remoteHeads.add(m[1]);
+    }
+  }
+
+  // PR state: one gh call, mapped by head branch (keep the most recent per head).
+  let ghAvailable = false;
+  const prByBranch = {};
+  let remoteUrl = '';
+  try {
+    remoteUrl = git(['remote', 'get-url', 'origin']);
+  } catch {}
+  const repo = parseRepo(remoteUrl);
+  if (repo && ghUsable(repo)) {
+    ghAvailable = true;
+    const prs = ghJson([
+      'pr', 'list', '--state', 'all', '--limit', '200',
+      '--json', 'number,headRefName,baseRefName,state,isDraft,reviewDecision,statusCheckRollup',
+    ]);
+    if (Array.isArray(prs)) {
+      for (const pr of prs) {
+        if (!(pr.headRefName in prByBranch)) prByBranch[pr.headRefName] = pr;
+      }
+    }
+  }
+
+  const rows = buildListRows({
+    branches,
+    current,
+    remoteHeads,
+    prByBranch,
+    baseOf: (b) => branchBase(b) || defaultBase(),
+    ghAvailable,
+  });
+  for (const line of renderList(rows)) console.log(line);
+  if (!ghAvailable) {
+    console.log('');
+    console.log('(PR/checks columns need the gh CLI on a GitHub remote: https://cli.github.com)');
+  }
+}
+
+// --- completion: emit a shell-completion script -----------------------------
+
+function completionBash() {
+  const cmds = COMMANDS.map((c) => c.name).join(' ');
+  const cases = Object.entries(FLAGS)
+    .map(([cmd, fl]) => `    ${cmd}) COMPREPLY=( $(compgen -W "${fl.join(' ')}" -- "$cur") ); return;;`)
+    .join('\n');
+  return `# ${PROG} bash completion.
+# Install: add to ~/.bashrc:  source <(${PROG} completion bash)
+_git_shit() {
+  local cur="\${COMP_WORDS[COMP_CWORD]}"
+  if [ "\$COMP_CWORD" -eq 1 ]; then
+    COMPREPLY=( \$(compgen -W "${cmds}" -- "\$cur") )
+    return
+  fi
+  case "\${COMP_WORDS[1]}" in
+${cases}
+    completion) COMPREPLY=( \$(compgen -W "bash zsh fish" -- "\$cur") ); return;;
+  esac
+}
+complete -F _git_shit ${PROG}
+`;
+}
+
+function completionZsh() {
+  const describe = COMMANDS.map((c) => `    '${c.name}:${c.desc}'`).join('\n');
+  const cases = Object.entries(FLAGS)
+    .map(([cmd, fl]) => `    ${cmd}) _values 'flag' ${fl.map((f) => `'${f}'`).join(' ')};;`)
+    .join('\n');
+  return `#compdef ${PROG}
+# ${PROG} zsh completion.
+# Install: add to ~/.zshrc:  source <(${PROG} completion zsh)
+_git-shit() {
+  local -a cmds
+  cmds=(
+${describe}
+  )
+  if (( CURRENT == 2 )); then
+    _describe 'command' cmds
+    return
+  fi
+  case \$words[2] in
+${cases}
+    completion) _values 'shell' 'bash' 'zsh' 'fish';;
+  esac
+}
+compdef _git-shit ${PROG}
+`;
+}
+
+function completionFish() {
+  const sub = COMMANDS.map(
+    (c) => `complete -c ${PROG} -n '__fish_use_subcommand' -a ${c.name} -d '${c.desc}'`
+  ).join('\n');
+  const flagLines = Object.entries(FLAGS)
+    .flatMap(([cmd, fl]) =>
+      fl.map((f) => {
+        const name = f.replace(/^--/, '').replace(/=$/, '');
+        return `complete -c ${PROG} -n '__fish_seen_subcommand_from ${cmd}' -l ${name}`;
+      })
+    )
+    .join('\n');
+  return `# ${PROG} fish completion.
+# Install: ${PROG} completion fish > ~/.config/fish/completions/${PROG}.fish
+complete -c ${PROG} -f
+${sub}
+${flagLines}
+complete -c ${PROG} -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish'
+`;
+}
+
+function cmdCompletion(shell) {
+  const scripts = { bash: completionBash, zsh: completionZsh, fish: completionFish };
+  const gen = scripts[shell];
+  if (!gen) {
+    fail(
+      `Usage: ${PROG} completion <bash|zsh|fish>`,
+      'Prints a completion script. Load it in your shell, e.g.:',
+      `  source <(${PROG} completion bash)   # or zsh`,
+      `  ${PROG} completion fish > ~/.config/fish/completions/${PROG}.fish`
+    );
+  }
+  process.stdout.write(gen());
+}
+
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   const flags = rest.filter((a) => a.startsWith('--'));
@@ -870,13 +1192,16 @@ async function main() {
       cmdStart(pos[0], pos[1]);
       break;
     case 'ship': {
+      const opts = { draft: false, web: false, reviewers: [], labels: [], assignees: [] };
       for (const f of flags) {
-        if (f !== '--draft' && f !== '--web') fail(`Unknown flag for ship: ${f}`);
+        if (f === '--draft') opts.draft = true;
+        else if (f === '--web') opts.web = true;
+        else if (f.startsWith('--reviewer=')) opts.reviewers.push(...splitList(f.slice('--reviewer='.length)));
+        else if (f.startsWith('--label=')) opts.labels.push(...splitList(f.slice('--label='.length)));
+        else if (f.startsWith('--assignee=')) opts.assignees.push(...splitList(f.slice('--assignee='.length)));
+        else fail(`Unknown flag for ship: ${f}`, 'Use --reviewer=a,b / --label=x / --assignee=@me (with =).');
       }
-      await cmdShip(pos[0], {
-        draft: flags.includes('--draft'),
-        web: flags.includes('--web'),
-      });
+      await cmdShip(pos[0], opts);
       break;
     }
     case 'sync': {
@@ -907,6 +1232,12 @@ async function main() {
     case 'status':
       cmdStatus();
       break;
+    case 'list':
+      cmdList();
+      break;
+    case 'completion':
+      cmdCompletion(pos[0]);
+      break;
     default:
       usage();
   }
@@ -919,4 +1250,22 @@ if (require.main === module) {
 }
 
 // Exported for tests; the CLI entry point is the guarded main() above.
-module.exports = { prTitleBody, prTemplate, defaultBase, gitflowInitialized, publishPlan };
+module.exports = {
+  prTitleBody,
+  prTemplate,
+  defaultBase,
+  gitflowInitialized,
+  publishPlan,
+  parseRepo,
+  splitList,
+  uniq,
+  prCreateArgs,
+  checksSummary,
+  reviewSummary,
+  prCellText,
+  buildListRows,
+  renderList,
+  completionBash,
+  completionZsh,
+  completionFish,
+};
