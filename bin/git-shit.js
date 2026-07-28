@@ -41,7 +41,7 @@
 
 'use strict';
 
-const { execFileSync, spawnSync } = require('child_process');
+const { execFileSync, spawnSync, spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -65,9 +65,11 @@ const COMMANDS = [
   { name: 'version', desc: 'Show the version' },
 ];
 const FLAGS = {
+  start: ['--on='],
   ship: ['--draft', '--web', '--reviewer=', '--label=', '--assignee='],
   sync: ['--merge', '--rebase'],
-  merge: ['--merge', '--squash', '--rebase'],
+  merge: ['--merge', '--squash', '--rebase', '--when-green'],
+  list: ['--plain'],
 };
 
 // The default PR target when a branch has no base recorded by `start` and no
@@ -127,6 +129,48 @@ function run(cmd, args) {
 
 function commandExists(cmd) {
   return spawnSync('command', ['-v', cmd], { shell: true, stdio: 'ignore' }).status === 0;
+}
+
+// Does a local branch with this exact name exist?
+function localBranchExists(branch) {
+  return (
+    spawnSync('git', ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], {
+      stdio: 'ignore',
+    }).status === 0
+  );
+}
+
+// Is this branch published to origin right now? (one server round-trip)
+function originHasBranch(branch) {
+  return (
+    spawnSync('git', ['ls-remote', '--exit-code', '--heads', 'origin', branch], {
+      stdio: 'ignore',
+    }).status === 0
+  );
+}
+
+// A base is a *stack parent* (rather than a long-lived integration branch like
+// staging/main) when it's itself a feature branch. Shipping onto it makes a
+// stacked PR; when it merges its children get restacked onto its own base.
+function isStackedBase(base, prefix) {
+  return !!base && base.startsWith(prefix);
+}
+
+// Best-effort desktop notification, plus a terminal bell so it's noticed even
+// headless. Used by `merge --when-green` when the wait resolves.
+function notify(title, message) {
+  process.stdout.write('\x07');
+  try {
+    if (process.platform === 'darwin' && commandExists('osascript')) {
+      spawnSync(
+        'osascript',
+        ['-e', `display notification ${JSON.stringify(message)} with title ${JSON.stringify(title)}`],
+        { stdio: 'ignore' }
+      );
+    } else if (commandExists('notify-send')) {
+      spawnSync('notify-send', [title, message], { stdio: 'ignore' });
+    }
+  } catch {}
 }
 
 function featurePrefix() {
@@ -198,16 +242,83 @@ function ghJson(args) {
   }
 }
 
+// --- async runners + spinner ------------------------------------------------
+// The network calls (`gh pr list/view`, `git ls-remote`) are the slow part of
+// list/status/merge. Running them async (instead of spawnSync) lets a spinner
+// animate while they're in flight, and lets independent ones run in parallel.
+
+// Run a command and capture stdout/stderr without blocking the event loop.
+function spawnCapture(cmd, args) {
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    let child;
+    try {
+      child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (error) {
+      return resolve({ status: null, stdout, stderr, error });
+    }
+    child.stdout.on('data', (d) => (stdout += d));
+    child.stderr.on('data', (d) => (stderr += d));
+    child.on('error', (error) => resolve({ status: null, stdout, stderr, error }));
+    child.on('close', (status) => resolve({ status, stdout, stderr }));
+  });
+}
+
+// Async ghJson: parse gh's JSON output, null on any failure.
+async function ghJsonAsync(args) {
+  const r = await spawnCapture('gh', args);
+  if (r.status !== 0) return null;
+  try {
+    return JSON.parse(r.stdout);
+  } catch {
+    return null;
+  }
+}
+
+// A tiny spinner on stderr (so it never pollutes captured/piped stdout). On a
+// non-TTY it prints the label once; otherwise it animates until stopped.
+function startSpinner(label) {
+  if (!process.stderr.isTTY) {
+    if (label) process.stderr.write(`${label}...\n`);
+    return { stop() {} };
+  }
+  const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+  let i = 0;
+  const draw = () => process.stderr.write(`\r\x1b[K${frames[i = (i + 1) % frames.length]} ${label}`);
+  process.stderr.write('\x1b[?25l'); // hide cursor
+  draw();
+  const timer = setInterval(draw, 80);
+  return {
+    stop() {
+      clearInterval(timer);
+      process.stderr.write('\r\x1b[K\x1b[?25h'); // clear line, show cursor
+    },
+  };
+}
+
+// Run async work under a spinner, always clearing it (even on throw).
+async function withSpinner(label, work) {
+  const sp = startSpinner(label);
+  try {
+    return await work();
+  } finally {
+    sp.stop();
+  }
+}
+
 function usage(exitCode = 1) {
   const base = defaultBase();
   console.log(`${PROG} ${VERSION}
 
 Usage:
-  ${PROG} start <name> [base]
+  ${PROG} start <name> [base] [--on=<parent>]
                          Start a new git-flow feature. With base, branch off
                          origin/<base> (e.g. production) instead of git-flow's
                          develop, and make <base> the default PR target for
-                         this branch.
+                         this branch. With --on=<parent>, stack it on another
+                         feature branch: its PR targets <parent>, and when
+                         <parent> merges this branch is restacked automatically.
   ${PROG} ship [dest] [--draft] [--web]
        [--reviewer=a,b] [--label=x] [--assignee=@me]
                          Push current feature and open a PR against dest
@@ -222,16 +333,21 @@ Usage:
                          Catch the current branch up to its base: fetch, then
                          rebase (or --merge) origin/<base> into it (default:
                          the branch's recorded base, else ${base}).
-  ${PROG} merge [--merge|--squash|--rebase]
+  ${PROG} merge [--merge|--squash|--rebase] [--when-green]
                          Merge the feature's open PR with gh (GitHub only,
-                         default: --merge), then clean up like 'done'
+                         default: --merge), then clean up like 'done'.
+                         --when-green waits for checks to pass first and
+                         notifies you when it merges (or a check fails).
   ${PROG} done [dest]    After the PR is merged: checkout dest (default: the
                          branch's recorded base, else ${base}), pull, delete
-                         the local feature branch, prune stale refs
+                         the local feature branch, prune stale refs, and
+                         restack any branches that were stacked on it.
   ${PROG} status         Show branch, publish state, PR state, and commits
                          vs the branch's base
-  ${PROG} list           Dashboard of every ${featurePrefix()}* branch: base,
-                         publish state, and live PR/checks/review state
+  ${PROG} list [--plain] Dashboard of every ${featurePrefix()}* branch: base,
+                         publish state, and live PR/checks/review state. In a
+                         terminal it's an interactive board (↑/↓, o/c/s/m/r/q);
+                         --plain (or piping) prints the static table.
   ${PROG} completion <bash|zsh|fish>
                          Print a shell-completion script for the given shell
   ${PROG} help           Show this help    (also --help, -h)
@@ -379,10 +495,26 @@ end tell
   console.log('    Timed out waiting for the button — click Create pull request yourself.');
 }
 
-function cmdStart(name, base) {
-  if (!name) fail(`Usage: ${PROG} start <name> [base]`);
+// Resolve a `--on=<parent>` value to a local branch name. Accepts either the
+// short feature name ('feat-a') or the full branch ('feature/feat-a').
+function resolveParent(on, prefix) {
+  const candidates = on.startsWith(prefix) ? [on] : [`${prefix}${on}`, on];
+  for (const c of candidates) if (localBranchExists(c)) return c;
+  return null;
+}
+
+function cmdStart(name, base, opts = {}) {
+  if (!name) fail(`Usage: ${PROG} start <name> [base] [--on=<parent>]`);
   const prefix = featurePrefix();
   const branch = `${prefix}${name}`;
+
+  if (opts.on && base) {
+    fail(
+      'Pass either a base or --on=<parent>, not both.',
+      '  base        branches off origin/<base> (a long-lived branch)',
+      '  --on=parent stacks this branch on another feature branch'
+    );
+  }
 
   // A stale remote-tracking ref (branch deleted on origin but never pruned
   // locally) makes `git flow feature start` refuse the name — prune first.
@@ -420,8 +552,26 @@ function cmdStart(name, base) {
   // Resolve the base to branch from (default: git-flow's develop branch).
   // Prefer the just-fetched origin/<base> so the feature starts from the
   // latest remote state, not a possibly stale local branch.
+  //
+  // recordedBase is what gets stored as this branch's default PR target. With
+  // --on=<parent> it's the parent feature branch (a stacked PR); with a plain
+  // base argument it's that base branch.
   let baseRef = '';
-  if (base) {
+  let recordedBase = '';
+  if (opts.on) {
+    // Stacked: branch off the tip of a local parent feature branch. The parent
+    // need not be on origin yet — it just has to be shipped before this child.
+    const parent = resolveParent(opts.on, prefix);
+    if (!parent) {
+      fail(
+        `Parent branch for --on=${opts.on} not found locally.`,
+        `Create or check out the parent first, e.g. ${PROG} start ${opts.on}.`
+      );
+    }
+    if (parent === branch) fail('A branch cannot be stacked on itself.');
+    baseRef = parent;
+    recordedBase = parent;
+  } else if (base) {
     const baseOnOrigin =
       spawnSync('git', ['show-ref', '--verify', '--quiet', `refs/remotes/origin/${base}`], {
         stdio: 'ignore',
@@ -446,18 +596,23 @@ function cmdStart(name, base) {
   console.log(`==> git flow feature start ${name}${baseRef ? ` ${baseRef}` : ''}`);
   run('git', ['flow', 'feature', 'start', name, ...(baseRef ? [baseRef] : [])]);
 
-  if (base) {
-    // Branching off origin/<base> makes git track it as upstream — drop that
-    // so `git pull` / the Published check don't point at the base branch.
+  if (recordedBase) {
+    // Branching off another ref makes git track it as upstream — drop that so
+    // `git pull` / the Published check don't point at the base branch.
     // (`git flow feature publish` sets the real upstream later.)
     spawnSync('git', ['branch', '--unset-upstream', branch], { stdio: 'ignore' });
-    // Remember the base: ship/done/status default to it for this branch.
-    run('git', ['config', `branch.${branch}.gitshitbase`, base]);
+    // Remember the base: ship/sync/done/status default to it for this branch.
+    run('git', ['config', `branch.${branch}.gitshitbase`, recordedBase]);
   }
 
   console.log('');
   console.log(`Feature branch '${branch}' created${baseRef ? ` from ${baseRef}` : ''}.`);
-  if (base) console.log(`PRs from this branch will target '${base}' by default.`);
+  if (opts.on) {
+    console.log(`Stacked on '${recordedBase}' — its PR will target that branch.`);
+    console.log(`Ship '${recordedBase}' first, then ${PROG} ship this one.`);
+  } else if (recordedBase) {
+    console.log(`PRs from this branch will target '${recordedBase}' by default.`);
+  }
   console.log(`Do your work, commit, then run: ${PROG} ship`);
 }
 
@@ -557,8 +712,10 @@ function prPeople(opts) {
 }
 
 // Create the PR with `gh pr create` (or recognise the one already open).
-function shipViaGh(branch, baseBranch, opts = {}) {
-  const existing = ghJson(['pr', 'view', branch, '--json', 'number,url,state,isDraft']);
+async function shipViaGh(branch, baseBranch, opts = {}) {
+  const existing = await withSpinner('Checking for an existing PR', () =>
+    ghJsonAsync(['pr', 'view', branch, '--json', 'number,url,state,isDraft'])
+  );
   if (existing && existing.state === 'OPEN') {
     console.log(
       `==> PR #${existing.number}${existing.isDraft ? ' (draft)' : ''} already open — it now has your latest commits.`
@@ -607,6 +764,9 @@ async function cmdShip(dest, opts = {}) {
   const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
   const baseBranch = dest || branchBase(branch) || defaultBase();
   const isFeature = branch.startsWith(prefix);
+  // Stacked: the PR targets another feature branch (its parent) rather than a
+  // long-lived base. The parent has to be shipped first so origin has it.
+  const stacked = isStackedBase(baseBranch, prefix) && baseBranch !== branch;
 
   if (!isFeature) {
     // Not a git-flow feature branch — ship it anyway with a plain push below
@@ -619,6 +779,10 @@ async function cmdShip(dest, opts = {}) {
       `Current branch '${branch}' is also the PR target — nothing to ship.`,
       `Pick a different destination, e.g. ${PROG} ship <dest>.`
     );
+  }
+
+  if (stacked) {
+    console.log(`Note: stacked PR — '${branch}' targets its parent '${baseBranch}'.`);
   }
 
   if (git(['status', '--porcelain']) !== '') {
@@ -638,6 +802,14 @@ async function cmdShip(dest, opts = {}) {
       stdio: 'ignore',
     }).status === 0;
   if (!destOnOrigin) {
+    if (stacked) {
+      fail(
+        `Parent branch '${baseBranch}' isn't on origin yet — a stacked PR needs it first.`,
+        `Ship the parent, then this one:`,
+        `  git checkout ${baseBranch} && ${PROG} ship`,
+        `  git checkout ${branch} && ${PROG} ship`
+      );
+    }
     fail(
       `Destination branch '${baseBranch}' does not exist on origin.`,
       `Usage: ${PROG} ship [dest]   (default: ${defaultBase()})`
@@ -668,7 +840,7 @@ async function cmdShip(dest, opts = {}) {
   }
 
   if (useGh) {
-    shipViaGh(branch, baseBranch, opts);
+    await shipViaGh(branch, baseBranch, opts);
     return;
   }
 
@@ -787,8 +959,47 @@ function cmdSync(dest, opts = {}) {
   }
 }
 
+// Poll a PR's checks until they're all green (or one fails), returning
+// 'green' | 'merged' when it's OK to proceed. Fails the process on a failing
+// check or timeout. A PR with no checks at all counts as green immediately.
+async function waitForGreen(branch) {
+  const intervalMs = 20_000;
+  const deadline = Date.now() + 60 * 60 * 1000; // give up after an hour
+  console.log('==> Waiting for checks to pass (polling every 20s — Ctrl-C to stop)...');
+  for (;;) {
+    const pr = ghJson(['pr', 'view', branch, '--json', 'number,state,isDraft,statusCheckRollup,reviewDecision']);
+    if (!pr) fail(`Can't read the PR for '${branch}' any more — did it get closed?`);
+    if (pr.state === 'MERGED') {
+      console.log(`PR #${pr.number} was merged elsewhere.`);
+      return 'merged';
+    }
+    if (pr.state !== 'OPEN') fail(`PR #${pr.number} is ${String(pr.state).toLowerCase()} — stopping.`);
+
+    const t = tallyChecks(pr.statusCheckRollup);
+    if (t.fail > 0) {
+      notify('git-shit: checks failed', `${branch}: ${t.fail} check(s) failing`);
+      fail(
+        `${t.fail} check(s) failing on PR #${pr.number} — not merging.`,
+        `See what broke: gh pr checks ${pr.number}`
+      );
+    }
+    if (t.total === 0 || t.pending === 0) {
+      console.log(`==> Checks green${t.total ? ` (${t.pass}/${t.total})` : ' (none configured)'}.`);
+      return 'green';
+    }
+    if (Date.now() > deadline) {
+      notify('git-shit: still waiting', `${branch}: checks not finished after 1h`);
+      fail(`Gave up after 1h — ${t.pending} check(s) on PR #${pr.number} still pending.`);
+    }
+    const rev = pr.reviewDecision ? `, review ${pr.reviewDecision.toLowerCase().replace(/_/g, ' ')}` : '';
+    console.log(`    ${t.pass}/${t.total} passed, ${t.pending} pending${rev} — retrying in 20s`);
+    await sleep(intervalMs);
+  }
+}
+
 // Merge the current feature's open PR with gh, then clean up like `done`.
-function cmdMerge(strategy) {
+// With opts.whenGreen, wait for checks to pass first, then notify on merge.
+async function cmdMerge(strategy, opts = {}) {
   const repo = resolveRepo();
   const prefix = featurePrefix();
   const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
@@ -834,7 +1045,9 @@ function cmdMerge(strategy) {
     );
   }
 
-  const pr = ghJson(['pr', 'view', branch, '--json', 'number,url,state,baseRefName,isDraft']);
+  const pr = await withSpinner('Looking up the open PR', () =>
+    ghJsonAsync(['pr', 'view', branch, '--json', 'number,url,state,baseRefName,isDraft'])
+  );
   if (!pr || pr.state !== 'OPEN') {
     fail(`No open PR found for '${branch}'. Create one first: ${PROG} ship`);
   }
@@ -845,11 +1058,99 @@ function cmdMerge(strategy) {
     );
   }
 
+  if (opts.whenGreen) {
+    const state = await waitForGreen(branch);
+    if (state === 'merged') {
+      // Someone merged it while we waited — just clean up locally.
+      console.log('');
+      cmdDone(pr.baseRefName);
+      notify('git-shit: cleaned up', `${branch} was already merged`);
+      return;
+    }
+  }
+
   console.log(`==> Merging PR #${pr.number} (${strategy.slice(2)}): ${branch} -> ${pr.baseRefName}`);
   run('gh', ['pr', 'merge', String(pr.number), strategy]);
+  notify('git-shit: PR merged', `#${pr.number} ${branch} -> ${pr.baseRefName}`);
 
   console.log('');
   cmdDone(pr.baseRefName);
+}
+
+function safeRemoteUrl() {
+  try {
+    return git(['remote', 'get-url', 'origin']);
+  } catch {
+    return '';
+  }
+}
+
+// Local feature branches stacked directly on `parent` — their recorded base is
+// exactly `parent` (read from `branch.<name>.gitshitbase`).
+function childrenOf(parent) {
+  let out = '';
+  try {
+    out = git(['config', '--get-regexp', '^branch\\..*\\.gitshitbase$']);
+  } catch {
+    return [];
+  }
+  const kids = [];
+  for (const line of out.split('\n')) {
+    const m = line.match(/^branch\.(.+)\.gitshitbase (.+)$/);
+    if (m && m[2] === parent && m[1] !== parent && localBranchExists(m[1])) kids.push(m[1]);
+  }
+  return kids;
+}
+
+// After `parent` merges into `newBase`, its direct children still branch off
+// the (now-merged, about-to-vanish) parent. Rebase each onto `newBase`, drop
+// the parent's now-redundant commits (git rebase --onto uses the parent's old
+// tip as the upstream), retarget its recorded base + open PR, and force-push.
+// Deeper descendants keep their own recorded base — a note points to sync.
+function restackChildren(parent, newBase, oldTip) {
+  const kids = childrenOf(parent);
+  if (!kids.length) return;
+
+  console.log('');
+  console.log(`==> Restacking ${kids.length} branch(es) stacked on '${parent}' onto '${newBase}'...`);
+
+  const repo = parseRepo(safeRemoteUrl());
+  const gh = repo && ghUsable(repo);
+
+  for (const child of kids) {
+    console.log(`==> ${child}: rebasing onto ${newBase}`);
+    const r = spawnSync('git', ['rebase', '--onto', newBase, oldTip, child], { stdio: 'inherit' });
+    if (r.status !== 0) {
+      spawnSync('git', ['rebase', '--abort'], { stdio: 'ignore' });
+      console.log(`    Couldn't auto-restack '${child}' (conflicts). Finish it by hand:`);
+      console.log(`      git rebase --onto ${newBase} ${oldTip} ${child}`);
+      console.log(`      git config branch.${child}.gitshitbase ${newBase}`);
+      console.log(`      git push --force-with-lease origin ${child}   # if published`);
+      continue;
+    }
+    // The rebase left us on `child`. Record the new base, retarget the PR, push.
+    run('git', ['config', `branch.${child}.gitshitbase`, newBase]);
+    if (originHasBranch(child)) {
+      if (gh) {
+        const pr = ghJson(['pr', 'view', child, '--json', 'number,state']);
+        if (pr && pr.state === 'OPEN') {
+          console.log(`    retargeting PR #${pr.number} base -> ${newBase}`);
+          spawnSync('gh', ['pr', 'edit', String(pr.number), '--base', newBase], { stdio: 'inherit' });
+        }
+      }
+      console.log(`    git push --force-with-lease origin ${child}`);
+      const push = spawnSync('git', ['push', '--force-with-lease', 'origin', child], { stdio: 'inherit' });
+      if (push.status !== 0) {
+        // The merge already landed — don't abort the rest of the restack over a
+        // stale lease; just tell the user to push the rebased child by hand.
+        console.log(`    Couldn't push '${child}' — run: git push --force-with-lease origin ${child}`);
+      }
+    }
+    console.log(`    '${child}' now stacked on '${newBase}'.`);
+  }
+
+  // Rebases left us on the last child — land back on the base for a clean end.
+  spawnSync('git', ['checkout', newBase], { stdio: 'ignore' });
 }
 
 function cmdDone(dest) {
@@ -860,6 +1161,13 @@ function cmdDone(dest) {
   if (git(['status', '--porcelain']) !== '') {
     fail('You have uncommitted changes. Commit or stash them before cleaning up.');
   }
+
+  // Capture the merged branch's tip before it's deleted — restackChildren needs
+  // it as the rebase upstream so children shed exactly the parent's commits.
+  let oldTip = '';
+  try {
+    oldTip = git(['rev-parse', branch]);
+  } catch {}
 
   console.log(`==> git checkout ${baseBranch}`);
   run('git', ['checkout', baseBranch]);
@@ -886,11 +1194,15 @@ function cmdDone(dest) {
   console.log('==> git fetch --prune origin');
   run('git', ['fetch', '--prune', 'origin']);
 
+  // Restack any branches that were stacked on the branch we just merged so they
+  // now target its base instead of a branch that's about to disappear.
+  if (oldTip) restackChildren(branch, baseBranch, oldTip);
+
   console.log('');
   console.log(`All cleaned up. Start the next one with: ${PROG} start <name>`);
 }
 
-function cmdStatus() {
+async function cmdStatus() {
   const prefix = featurePrefix();
   const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
   const isFeature = branch.startsWith(prefix);
@@ -899,14 +1211,26 @@ function cmdStatus() {
 
   console.log(`Branch:     ${branch}${isFeature ? '' : `  (not a ${prefix}* branch)`}`);
   if (base !== defaultBase()) {
-    console.log(`Base:       ${base} (recorded by '${PROG} start')`);
+    const note = isStackedBase(base, prefix) ? 'stacked parent' : `recorded by '${PROG} start'`;
+    console.log(`Base:       ${base} (${note})`);
   }
   console.log(`Changes:    ${dirty ? 'uncommitted changes present' : 'clean'}`);
 
-  const onOrigin =
-    spawnSync('git', ['ls-remote', '--exit-code', '--heads', 'origin', branch], {
-      stdio: 'ignore',
-    }).status === 0;
+  // The two network calls — is the branch published, and its live PR — are
+  // independent, so fetch them together under one spinner instead of blocking
+  // silently one after the other.
+  const repo = isFeature ? resolveRepo() : null;
+  const gh = isFeature && repo && ghUsable(repo);
+  const [onOrigin, pr] = await withSpinner('Checking origin and PR state', async () => {
+    const [ls, prJson] = await Promise.all([
+      spawnCapture('git', ['ls-remote', '--exit-code', '--heads', 'origin', branch]),
+      gh
+        ? ghJsonAsync(['pr', 'view', branch, '--json', 'number,url,state,isDraft,reviewDecision,mergeStateStatus'])
+        : Promise.resolve(null),
+    ]);
+    return [ls.status === 0, prJson];
+  });
+
   console.log(`Published:  ${onOrigin ? `yes (origin/${branch})` : 'no'}`);
 
   if (onOrigin) {
@@ -926,10 +1250,6 @@ function cmdStatus() {
   }
 
   if (isFeature) {
-    const repo = resolveRepo();
-    const pr = ghUsable(repo)
-      ? ghJson(['pr', 'view', branch, '--json', 'number,url,state,isDraft,reviewDecision,mergeStateStatus'])
-      : null;
     if (pr) {
       const bits = [pr.isDraft ? 'draft' : pr.state.toLowerCase()];
       if (pr.reviewDecision) bits.push(`review: ${pr.reviewDecision.toLowerCase().replace(/_/g, ' ')}`);
@@ -938,7 +1258,7 @@ function cmdStatus() {
       }
       console.log(`PR:         #${pr.number} (${bits.join(', ')})`);
       console.log(`            ${pr.url}`);
-    } else if (ghUsable(repo)) {
+    } else if (gh) {
       console.log(`PR:         none yet — create one with: ${PROG} ship`);
     } else {
       console.log(`PR page:    ${buildPrUrl(repo, branch, base)}`);
@@ -950,20 +1270,29 @@ function cmdStatus() {
 // Pure formatting helpers (below) are unit-tested; cmdList only gathers the
 // live data (branches, origin heads, open PRs) and hands it to them.
 
+// Tally a PR's statusCheckRollup into {pass, fail, pending, total}. A check is a
+// CheckRun (has .conclusion once finished, else .status) or a StatusContext
+// (.state). The single source of truth for both the `list` summary and the
+// `merge --when-green` wait loop.
+function tallyChecks(rollup) {
+  const t = { pass: 0, fail: 0, pending: 0, total: 0 };
+  if (!Array.isArray(rollup)) return t;
+  for (const c of rollup) {
+    t.total++;
+    const s = String(c.conclusion || c.state || '').toUpperCase();
+    if (s === 'SUCCESS' || s === 'NEUTRAL' || s === 'SKIPPED') t.pass++;
+    else if (['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE'].includes(s)) t.fail++;
+    else t.pending++;
+  }
+  return t;
+}
+
 // One-line summary of a PR's check runs, or '' if there are none.
 function checksSummary(rollup) {
-  if (!Array.isArray(rollup) || rollup.length === 0) return '';
-  let pass = 0;
-  let fail = 0;
-  let pending = 0;
-  for (const c of rollup) {
-    const s = String(c.conclusion || c.state || '').toUpperCase();
-    if (s === 'SUCCESS' || s === 'NEUTRAL' || s === 'SKIPPED') pass++;
-    else if (['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE'].includes(s)) fail++;
-    else pending++;
-  }
-  if (fail) return `checks: ${fail} failing`;
-  if (pending) return `checks: ${pass}/${rollup.length}`;
+  const t = tallyChecks(rollup);
+  if (t.total === 0) return '';
+  if (t.fail) return `checks: ${t.fail} failing`;
+  if (t.pending) return `checks: ${t.pass}/${t.total}`;
   return 'checks: ok';
 }
 
@@ -997,16 +1326,70 @@ function prCellText(pr, published, ghAvailable) {
   return published ? 'no PR' : '—';
 }
 
+// The effective base of a branch for display: a live PR's real target wins,
+// else the branch's recorded/default base (what `ship` would target).
+function effectiveBaseOf(b, prByBranch, baseOf) {
+  const pr = prByBranch[b];
+  return (pr && pr.baseRefName) || baseOf(b);
+}
+
+// How deep in a stack a branch sits: 0 for a branch whose base is a long-lived
+// branch, 1 for one stacked on another branch in the set, and so on.
+function stackDepth(b, branchSet, effBaseOf) {
+  let d = 0;
+  let cur = b;
+  const seen = new Set([b]);
+  while (d < 50) {
+    const base = effBaseOf(cur);
+    if (!branchSet.has(base) || seen.has(base)) break;
+    seen.add(base);
+    cur = base;
+    d++;
+  }
+  return d;
+}
+
+// Reorder feature branches so each stacked child follows its parent
+// (depth-first), preserving the input order among roots and siblings.
+function stackOrder(branches, effBaseOf) {
+  const inSet = new Set(branches);
+  const kids = new Map();
+  const roots = [];
+  for (const b of branches) {
+    const base = effBaseOf(b);
+    if (inSet.has(base) && base !== b) {
+      if (!kids.has(base)) kids.set(base, []);
+      kids.get(base).push(b);
+    } else {
+      roots.push(b);
+    }
+  }
+  const ordered = [];
+  const seen = new Set();
+  const visit = (b) => {
+    if (seen.has(b)) return;
+    seen.add(b);
+    ordered.push(b);
+    for (const k of kids.get(b) || []) visit(k);
+  };
+  for (const r of roots) visit(r);
+  for (const b of branches) if (!seen.has(b)) { seen.add(b); ordered.push(b); } // orphans/cycles
+  return ordered;
+}
+
 // Turn the gathered primitives into display rows (one per branch). When a PR
 // exists its real target wins the BASE column; otherwise it's the branch's
-// recorded/default base (what `ship` would target).
+// recorded/default base (what `ship` would target). `depth` marks stacking.
 function buildListRows({ branches, current, remoteHeads, prByBranch, baseOf, ghAvailable }) {
+  const branchSet = new Set(branches);
+  const effBaseOf = (b) => effectiveBaseOf(b, prByBranch, baseOf);
   return branches.map((b) => {
     const published = remoteHeads.has(b);
     const pr = prByBranch[b];
     return {
       mark: b === current ? '*' : ' ',
       branch: b,
+      depth: stackDepth(b, branchSet, effBaseOf),
       base: (pr && pr.baseRefName) || baseOf(b),
       state: published ? 'published' : 'local only',
       pr: prCellText(pr, published, ghAvailable),
@@ -1014,78 +1397,266 @@ function buildListRows({ branches, current, remoteHeads, prByBranch, baseOf, ghA
   });
 }
 
+// Branch column as displayed, indented with a tree glyph for stacked children.
+function branchLabel(row) {
+  return (row.depth > 0 ? '  '.repeat(row.depth - 1) + '└─ ' : '') + row.branch;
+}
+
 // Render rows as an aligned table (header + one line per row).
 function renderList(rows) {
-  const width = (key, head) => Math.max(head.length, ...rows.map((r) => r[key].length));
-  const bw = width('branch', 'BRANCH');
-  const baw = width('base', 'BASE');
-  const sw = width('state', 'STATE');
+  const width = (get, head) => Math.max(head.length, ...rows.map((r) => get(r).length));
+  const bw = width(branchLabel, 'BRANCH');
+  const baw = width((r) => r.base, 'BASE');
+  const sw = width((r) => r.state, 'STATE');
   const lines = [`  ${'BRANCH'.padEnd(bw)}  ${'BASE'.padEnd(baw)}  ${'STATE'.padEnd(sw)}  PR`];
   for (const r of rows) {
-    lines.push(`${r.mark} ${r.branch.padEnd(bw)}  ${r.base.padEnd(baw)}  ${r.state.padEnd(sw)}  ${r.pr}`.trimEnd());
+    lines.push(`${r.mark} ${branchLabel(r).padEnd(bw)}  ${r.base.padEnd(baw)}  ${r.state.padEnd(sw)}  ${r.pr}`.trimEnd());
   }
   return lines;
 }
 
-function cmdList() {
+// Gather everything the dashboard needs in the fewest round-trips: local feature
+// branches (most-recently-committed first), the set of published heads (one
+// ls-remote), and every PR keyed by head branch (one gh call).
+async function gatherListData(opts = {}) {
   const prefix = featurePrefix();
   const current = git(['rev-parse', '--abbrev-ref', 'HEAD']);
 
-  // Every local branch under the feature prefix, most-recently-committed first.
   const branches = git([
     'for-each-ref', '--sort=-committerdate', '--format=%(refname:short)', `refs/heads/${prefix}`,
   ])
     .split('\n')
     .filter(Boolean);
 
-  if (!branches.length) {
-    console.log(`No ${prefix}* branches yet. Start one with: ${PROG} start <name>`);
-    return;
-  }
-
-  // Published state: one ls-remote gives the authoritative set of origin heads.
   const remoteHeads = new Set();
-  const ls = spawnSync('git', ['ls-remote', '--heads', 'origin'], { encoding: 'utf8' });
-  if (ls.status === 0) {
-    for (const line of (ls.stdout || '').split('\n')) {
-      const m = line.match(/\trefs\/heads\/(.+)$/);
-      if (m) remoteHeads.add(m[1]);
-    }
-  }
-
-  // PR state: one gh call, mapped by head branch (keep the most recent per head).
-  let ghAvailable = false;
   const prByBranch = {};
-  let remoteUrl = '';
-  try {
-    remoteUrl = git(['remote', 'get-url', 'origin']);
-  } catch {}
-  const repo = parseRepo(remoteUrl);
-  if (repo && ghUsable(repo)) {
-    ghAvailable = true;
-    const prs = ghJson([
-      'pr', 'list', '--state', 'all', '--limit', '200',
-      '--json', 'number,headRefName,baseRefName,state,isDraft,reviewDecision,statusCheckRollup',
+  const repo = parseRepo(safeRemoteUrl());
+  const ghAvailable = !!(repo && ghUsable(repo));
+
+  if (!branches.length) return { prefix, current, branches, remoteHeads, prByBranch, repo, ghAvailable };
+
+  // Published state (ls-remote) and PR state (gh pr list) are independent — run
+  // them together under one spinner so the wait is the slower of the two, not
+  // their sum. `opts.quiet` skips the spinner (used by the board's redraw).
+  const spin = opts.quiet ? (l, w) => w() : withSpinner;
+  await spin(ghAvailable ? 'Loading branches and pull requests' : 'Loading branches', async () => {
+    const [ls, prs] = await Promise.all([
+      spawnCapture('git', ['ls-remote', '--heads', 'origin']),
+      ghAvailable
+        ? ghJsonAsync([
+            'pr', 'list', '--state', 'all', '--limit', '200',
+            '--json', 'number,headRefName,baseRefName,state,isDraft,reviewDecision,statusCheckRollup,url',
+          ])
+        : Promise.resolve(null),
     ]);
+    if (ls.status === 0) {
+      for (const line of (ls.stdout || '').split('\n')) {
+        const m = line.match(/\trefs\/heads\/(.+)$/);
+        if (m) remoteHeads.add(m[1]);
+      }
+    }
     if (Array.isArray(prs)) {
       for (const pr of prs) {
         if (!(pr.headRefName in prByBranch)) prByBranch[pr.headRefName] = pr;
       }
     }
-  }
-
-  const rows = buildListRows({
-    branches,
-    current,
-    remoteHeads,
-    prByBranch,
-    baseOf: (b) => branchBase(b) || defaultBase(),
-    ghAvailable,
   });
-  for (const line of renderList(rows)) console.log(line);
-  if (!ghAvailable) {
+
+  return { prefix, current, branches, remoteHeads, prByBranch, repo, ghAvailable };
+}
+
+// Stack-ordered display rows for the gathered data (shared by table + board).
+function orderedRows(data) {
+  const baseOf = (b) => branchBase(b) || defaultBase();
+  const effBaseOf = (b) => effectiveBaseOf(b, data.prByBranch, baseOf);
+  return buildListRows({
+    branches: stackOrder(data.branches, effBaseOf),
+    current: data.current,
+    remoteHeads: data.remoteHeads,
+    prByBranch: data.prByBranch,
+    baseOf,
+    ghAvailable: data.ghAvailable,
+  });
+}
+
+function renderStaticList(data) {
+  for (const line of renderList(orderedRows(data))) console.log(line);
+  if (!data.ghAvailable) {
     console.log('');
     console.log('(PR/checks columns need the gh CLI on a GitHub remote: https://cli.github.com)');
+  }
+}
+
+async function cmdList(opts = {}) {
+  const data = await gatherListData();
+  if (!data.branches.length) {
+    console.log(`No ${data.prefix}* branches yet. Start one with: ${PROG} start <name>`);
+    return;
+  }
+  // Interactive cockpit when attached to a terminal; plain table when piped,
+  // redirected, or asked for with --plain (keeps `list` scriptable).
+  if (!opts.plain && process.stdout.isTTY && process.stdin.isTTY) {
+    await runBoard(data);
+    return;
+  }
+  renderStaticList(data);
+}
+
+// --- list: interactive board ------------------------------------------------
+// A raw-mode, dependency-free cockpit: navigate the same rows the table shows
+// and act on the selected branch (open / checkout / ship / merge / refresh).
+
+const ANSI = {
+  clear: '\x1b[2J\x1b[H',
+  hideCursor: '\x1b[?25l',
+  showCursor: '\x1b[?25h',
+  reverse: '\x1b[7m',
+  dim: '\x1b[2m',
+  bold: '\x1b[1m',
+  reset: '\x1b[0m',
+};
+
+// Attach the pr object + published flag onto each display row so key actions
+// have what they need without re-deriving it.
+function boardItems(data) {
+  return orderedRows(data).map((r) => ({
+    ...r,
+    published: data.remoteHeads.has(r.branch),
+    prObj: data.prByBranch[r.branch] || null,
+  }));
+}
+
+// Resolve the next key press as a single string (raw mode delivers escape
+// sequences like an arrow key in one chunk).
+function readKey(stdin) {
+  return new Promise((resolve) => {
+    const onData = (d) => {
+      stdin.removeListener('data', onData);
+      resolve(d);
+    };
+    stdin.on('data', onData);
+  });
+}
+
+function drawBoard(items, sel, data) {
+  const { reverse, dim, bold, reset } = ANSI;
+  const bw = Math.max('BRANCH'.length, ...items.map((it) => branchLabel(it).length));
+  const baw = Math.max('BASE'.length, ...items.map((it) => it.base.length));
+  const sw = Math.max('STATE'.length, ...items.map((it) => it.state.length));
+
+  const out = [
+    `${bold}git-shit${reset}  ${dim}${items.length} ${data.prefix}* branch(es)${reset}`,
+    '',
+    `  ${dim}${'BRANCH'.padEnd(bw)}  ${'BASE'.padEnd(baw)}  ${'STATE'.padEnd(sw)}  PR${reset}`,
+  ];
+  items.forEach((it, i) => {
+    const line = `${it.mark} ${branchLabel(it).padEnd(bw)}  ${it.base.padEnd(baw)}  ${it.state.padEnd(sw)}  ${it.pr}`.trimEnd();
+    out.push(i === sel ? `${reverse}${line}${reset}` : line);
+  });
+  out.push('');
+  if (!data.ghAvailable) out.push(`${dim}(gh unavailable — ship/merge still work, PR columns don't)${reset}`);
+  out.push(`${dim}↑/↓ move · o open · c checkout · s ship · m merge · r refresh · q quit${reset}`);
+  process.stdout.write(ANSI.clear + out.join('\r\n') + '\r\n');
+}
+
+// Open the selected branch's PR (or its compare page when there's no PR yet).
+function openBoardTarget(it, data) {
+  if (it.prObj && it.prObj.url) return openUrl(it.prObj.url);
+  if (data.repo) openUrl(buildPrUrl(data.repo, it.branch, it.base));
+}
+
+async function runBoard(initial) {
+  let data = initial;
+  let items = boardItems(data);
+  let sel = Math.max(0, items.findIndex((it) => it.branch === data.current));
+
+  const stdin = process.stdin;
+  const restore = () => {
+    try { if (stdin.isTTY) stdin.setRawMode(false); } catch {}
+    stdin.pause();
+    process.stdout.write(ANSI.showCursor);
+  };
+  // Safety net: restore the terminal even if a sub-action calls process.exit.
+  process.on('exit', restore);
+
+  const enterRaw = () => {
+    stdin.resume();
+    stdin.setEncoding('utf8');
+    try { stdin.setRawMode(true); } catch {}
+    process.stdout.write(ANSI.hideCursor);
+  };
+  const reload = async () => {
+    // quiet: the board owns the screen, so the stderr spinner would fight it —
+    // we show our own one-line hint instead.
+    data = await gatherListData({ quiet: true });
+    items = boardItems(data);
+    if (sel >= items.length) sel = items.length - 1;
+    if (sel < 0) sel = 0;
+  };
+
+  // Drop out of the board, run a (possibly async) action against the real
+  // terminal, then wait for a key and re-enter the refreshed board.
+  const suspend = async (fn) => {
+    try { stdin.setRawMode(false); } catch {}
+    stdin.pause();
+    process.stdout.write(ANSI.showCursor + ANSI.clear);
+    try {
+      await fn();
+    } catch (e) {
+      console.error(e && e.message ? e.message : String(e));
+    }
+    process.stdout.write('\n(press any key to return)');
+    stdin.resume();
+    stdin.setEncoding('utf8');
+    try { stdin.setRawMode(true); } catch {}
+    await readKey(stdin);
+    await reload();
+    process.stdout.write(ANSI.hideCursor);
+    drawBoard(items, sel, data);
+  };
+  const checkout = (branch) => {
+    if (branch === data.current) return;
+    console.log(`==> git checkout ${branch}`);
+    run('git', ['checkout', branch]);
+  };
+
+  enterRaw();
+  drawBoard(items, sel, data);
+  try {
+    for (;;) {
+      const key = await readKey(stdin);
+      const it = items[sel];
+      if (key === 'q' || key === '\x03' || key === '\x1b') break;
+      else if (key === 'j' || key === '\x1b[B') sel = Math.min(items.length - 1, sel + 1);
+      else if (key === 'k' || key === '\x1b[A') sel = Math.max(0, sel - 1);
+      else if (key === 'g') sel = 0;
+      else if (key === 'G') sel = items.length - 1;
+      else if (key === 'r') {
+        process.stdout.write(`${ANSI.clear}Refreshing…`);
+        await reload();
+        drawBoard(items, sel, data);
+        continue;
+      }
+      else if ((key === 'o' || key === '\r' || key === '\n') && it) { openBoardTarget(it, data); continue; }
+      else if (key === 'c' && it) { await suspend(async () => checkout(it.branch)); continue; }
+      else if (key === 's' && it) {
+        await suspend(async () => {
+          checkout(it.branch);
+          await cmdShip(undefined, { draft: false, web: false, reviewers: [], labels: [], assignees: [] });
+        });
+        continue;
+      } else if (key === 'm' && it) {
+        await suspend(async () => {
+          checkout(it.branch);
+          await cmdMerge('--merge', {});
+        });
+        continue;
+      } else continue; // ignore unknown keys without a redraw
+      drawBoard(items, sel, data);
+    }
+  } finally {
+    restore();
+    process.removeListener('exit', restore);
   }
 }
 
@@ -1188,9 +1759,15 @@ async function main() {
   }
 
   switch (cmd) {
-    case 'start':
-      cmdStart(pos[0], pos[1]);
+    case 'start': {
+      const opts = {};
+      for (const f of flags) {
+        if (f.startsWith('--on=')) opts.on = f.slice('--on='.length);
+        else fail(`Unknown flag for start: ${f}`, 'Use --on=<parent> to stack on another feature branch.');
+      }
+      cmdStart(pos[0], pos[1], opts);
       break;
+    }
     case 'ship': {
       const opts = { draft: false, web: false, reviewers: [], labels: [], assignees: [] };
       for (const f of flags) {
@@ -1218,23 +1795,32 @@ async function main() {
     case 'merge': {
       const strategies = ['--merge', '--squash', '--rebase'];
       const chosen = [];
+      let whenGreen = false;
       for (const f of flags) {
-        if (!strategies.includes(f)) fail(`Unknown flag for merge: ${f}`);
-        if (!chosen.includes(f)) chosen.push(f);
+        if (f === '--when-green') whenGreen = true;
+        else if (strategies.includes(f)) {
+          if (!chosen.includes(f)) chosen.push(f);
+        } else fail(`Unknown flag for merge: ${f}`);
       }
       if (chosen.length > 1) fail('Pick one of --merge, --squash, --rebase.');
-      cmdMerge(chosen[0] || '--merge');
+      await cmdMerge(chosen[0] || '--merge', { whenGreen });
       break;
     }
     case 'done':
       cmdDone(pos[0]);
       break;
     case 'status':
-      cmdStatus();
+      await cmdStatus();
       break;
-    case 'list':
-      cmdList();
+    case 'list': {
+      const opts = {};
+      for (const f of flags) {
+        if (f === '--plain') opts.plain = true;
+        else fail(`Unknown flag for list: ${f}`, 'Use --plain for the non-interactive table.');
+      }
+      await cmdList(opts);
       break;
+    }
     case 'completion':
       cmdCompletion(pos[0]);
       break;
@@ -1260,10 +1846,16 @@ module.exports = {
   splitList,
   uniq,
   prCreateArgs,
+  tallyChecks,
   checksSummary,
   reviewSummary,
   prCellText,
+  isStackedBase,
+  effectiveBaseOf,
+  stackDepth,
+  stackOrder,
   buildListRows,
+  branchLabel,
   renderList,
   completionBash,
   completionZsh,
