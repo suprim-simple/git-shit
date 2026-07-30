@@ -191,6 +191,57 @@ function gitflowInitialized() {
   );
 }
 
+// git-flow's configured develop branch — what `feature start` branches off by
+// default and, the catch, insists is in sync with origin before it will start
+// *any* feature (see developStartBlock). Falls back to 'develop' when git-flow
+// isn't initialised.
+function developBranch() {
+  try {
+    return git(['config', 'gitflow.branch.develop']) || 'develop';
+  } catch {
+    return 'develop';
+  }
+}
+
+// Pure classification of ref A relative to ref B, given their tip SHAs and their
+// merge-base: 'same' | 'behind' | 'ahead' | 'diverged'. "behind" means A is an
+// ancestor of B (A can fast-forward up to B); "ahead" the reverse. An empty
+// merge-base means unrelated histories, which we treat as diverged. Exported
+// for tests.
+function classifyRel(aTip, bTip, mergeBase) {
+  if (aTip === bTip) return 'same';
+  if (!mergeBase) return 'diverged';
+  if (mergeBase === aTip) return 'behind';
+  if (mergeBase === bTip) return 'ahead';
+  return 'diverged';
+}
+
+// Would git-flow's `feature start` refuse to run because the local develop
+// branch has drifted from origin? git-flow checks develop against origin on
+// *every* feature start, no matter what base you pass, and dies when develop is
+// behind ("...may be fast-forwarded.") or has diverged ("Branches need merging
+// first.") — it only warns (and proceeds) when develop is ahead. Returns the
+// blocking relationship ('behind' | 'diverged') or '' when the gate wouldn't
+// fire. The gate only applies when both refs exist (git-flow guards its own
+// check on origin/<develop> existing, and a missing local develop is a
+// different, real error we shouldn't mask).
+function developStartBlock() {
+  const develop = developBranch();
+  const localRef = `refs/heads/${develop}`;
+  const remoteRef = `refs/remotes/origin/${develop}`;
+  const has = (ref) =>
+    spawnSync('git', ['show-ref', '--verify', '--quiet', ref], { stdio: 'ignore' }).status === 0;
+  if (!has(localRef) || !has(remoteRef)) return '';
+  let mergeBase = '';
+  try {
+    mergeBase = git(['merge-base', localRef, remoteRef]);
+  } catch {
+    mergeBase = ''; // unrelated histories
+  }
+  const rel = classifyRel(git(['rev-parse', localRef]), git(['rev-parse', remoteRef]), mergeBase);
+  return rel === 'behind' || rel === 'diverged' ? rel : '';
+}
+
 // How to publish the current branch to origin. `git flow feature publish` only
 // works in a git-flow-initialised repo; everywhere else a plain upstream push
 // is the equivalent, so `ship` works with or without git-flow.
@@ -228,6 +279,14 @@ function ghUsable(repo) {
       spawnSync('gh', ['auth', 'status', '--hostname', 'github.com'], { stdio: 'ignore' })
         .status === 0;
   }
+  // Pin every `gh` call to the origin repo. Otherwise, in a repo with more than
+  // one remote (e.g. a fork with origin + upstream), gh can't decide which one
+  // to use and aborts with "No default remote repository has been set". GH_REPO
+  // is gh's env-var form of `--repo` and is inherited by every gh child process.
+  // git-shit already treats origin as canonical everywhere, so this just makes
+  // gh agree instead of guessing. Every `gh pr …` path is gated behind this
+  // function, so setting it here covers ship/merge/status/list/restack.
+  if (ghOk && repo.nwo) process.env.GH_REPO = repo.nwo;
   return ghOk;
 }
 
@@ -370,7 +429,7 @@ function parseRepo(remoteUrl) {
   const host = m[1] === 'github.com' ? 'github' : 'bitbucket';
   const workspace = m[2];
   const repoSlug = m[3].replace(/\.git$/, '');
-  return { host, web: `https://${m[1]}/${workspace}/${repoSlug}` };
+  return { host, nwo: `${workspace}/${repoSlug}`, web: `https://${m[1]}/${workspace}/${repoSlug}` };
 }
 
 // The origin remote as {host, web}; exits with guidance if it can't be parsed.
@@ -572,6 +631,8 @@ function cmdStart(name, base, opts = {}) {
     baseRef = parent;
     recordedBase = parent;
   } else if (base) {
+    // Remember the base: ship/sync/done/status default to it for this branch.
+    recordedBase = base;
     const baseOnOrigin =
       spawnSync('git', ['show-ref', '--verify', '--quiet', `refs/remotes/origin/${base}`], {
         stdio: 'ignore',
@@ -593,15 +654,40 @@ function cmdStart(name, base, opts = {}) {
     }
   }
 
-  console.log(`==> git flow feature start ${name}${baseRef ? ` ${baseRef}` : ''}`);
-  run('git', ['flow', 'feature', 'start', name, ...(baseRef ? [baseRef] : [])]);
+  // git-flow's `feature start` refuses to run while the local develop branch
+  // has drifted from origin (see developStartBlock) — even though we always
+  // branch off a freshly-fetched origin ref, which has nothing to do with
+  // develop's own hygiene. When that gate would block, create the branch
+  // ourselves off the origin start point and leave the user's local develop
+  // untouched. Off a base/parent the start point is that ref; for a plain start
+  // it's origin/<develop> — git-shit treats origin as canonical everywhere, so
+  // this matches what `start` prefers anyway (the fetched remote state over a
+  // possibly stale local branch), and lands the identical branch git-flow would
+  // once develop was reconciled.
+  const develop = developBranch();
+  const block = developStartBlock();
+  if (block) {
+    const startPoint = baseRef || `origin/${develop}`;
+    console.log(`==> git checkout -b ${branch} ${startPoint}`);
+    console.log(
+      `    (git-flow won't start a feature while local '${develop}' ` +
+        `${block === 'behind' ? 'is behind' : 'has diverged from'} origin/${develop};`
+    );
+    console.log(`     branching off ${startPoint} directly — local '${develop}' is left untouched.)`);
+    run('git', ['checkout', '-b', branch, startPoint]);
+  } else {
+    console.log(`==> git flow feature start ${name}${baseRef ? ` ${baseRef}` : ''}`);
+    run('git', ['flow', 'feature', 'start', name, ...(baseRef ? [baseRef] : [])]);
+  }
 
+  // Whichever way it was created, branching off a remote-tracking ref makes git
+  // set it as this branch's upstream — drop that so `git pull` / the Published
+  // check don't point at the base. (`git flow feature publish` sets the real
+  // upstream later.) Harmless no-op when no upstream was set (a plain start off
+  // the local develop branch).
+  spawnSync('git', ['branch', '--unset-upstream', branch], { stdio: 'ignore' });
   if (recordedBase) {
-    // Branching off another ref makes git track it as upstream — drop that so
-    // `git pull` / the Published check don't point at the base branch.
-    // (`git flow feature publish` sets the real upstream later.)
-    spawnSync('git', ['branch', '--unset-upstream', branch], { stdio: 'ignore' });
-    // Remember the base: ship/sync/done/status default to it for this branch.
+    // ship/sync/done/status default to this base for the branch.
     run('git', ['config', `branch.${branch}.gitshitbase`, recordedBase]);
   }
 
@@ -1841,6 +1927,7 @@ module.exports = {
   prTemplate,
   defaultBase,
   gitflowInitialized,
+  classifyRel,
   publishPlan,
   parseRepo,
   splitList,

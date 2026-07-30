@@ -5,6 +5,7 @@
 
 const {
   parseRepo,
+  classifyRel,
   splitList,
   uniq,
   prCreateArgs,
@@ -41,19 +42,34 @@ function ok(name, cond) {
 // --- parseRepo --------------------------------------------------------------
 eq('parseRepo: github ssh',
   parseRepo('git@github.com:owner/repo.git'),
-  { host: 'github', web: 'https://github.com/owner/repo' });
+  { host: 'github', nwo: 'owner/repo', web: 'https://github.com/owner/repo' });
 eq('parseRepo: github https',
   parseRepo('https://github.com/owner/repo.git'),
-  { host: 'github', web: 'https://github.com/owner/repo' });
+  { host: 'github', nwo: 'owner/repo', web: 'https://github.com/owner/repo' });
 eq('parseRepo: bitbucket ssh',
   parseRepo('git@bitbucket.org:ws/repo.git'),
-  { host: 'bitbucket', web: 'https://bitbucket.org/ws/repo' });
+  { host: 'bitbucket', nwo: 'ws/repo', web: 'https://bitbucket.org/ws/repo' });
 eq('parseRepo: bitbucket https with user',
   parseRepo('https://user@bitbucket.org/ws/repo.git'),
-  { host: 'bitbucket', web: 'https://bitbucket.org/ws/repo' });
+  { host: 'bitbucket', nwo: 'ws/repo', web: 'https://bitbucket.org/ws/repo' });
 eq('parseRepo: no .git suffix', parseRepo('https://github.com/owner/repo').web, 'https://github.com/owner/repo');
+// nwo is owner/repo — used to pin gh to origin (GH_REPO) so a repo with several
+// remotes never trips gh's "No default remote repository has been set" error.
+eq('parseRepo: nwo is owner/repo', parseRepo('git@github.com:owner/repo.git').nwo, 'owner/repo');
+eq('parseRepo: nwo drops .git', parseRepo('https://github.com/owner/repo.git').nwo, 'owner/repo');
 eq('parseRepo: unknown host -> null', parseRepo('git@example.com:x/y.git'), null);
 eq('parseRepo: empty -> null', parseRepo(''), null);
+
+// --- classifyRel ------------------------------------------------------------
+// Drives the `start` decision to route around git-flow's develop-branch gate:
+// 'behind' and 'diverged' are the states git-flow refuses to start a feature
+// on, so start creates the branch off origin itself instead. (A = local
+// develop, B = origin/develop; "behind" = local is an ancestor of origin.)
+eq('classifyRel: identical tips -> same', classifyRel('aaa', 'aaa', 'aaa'), 'same');
+eq('classifyRel: local ancestor of origin -> behind', classifyRel('aaa', 'bbb', 'aaa'), 'behind');
+eq('classifyRel: origin ancestor of local -> ahead', classifyRel('bbb', 'aaa', 'aaa'), 'ahead');
+eq('classifyRel: shared older base -> diverged', classifyRel('aaa', 'bbb', 'ccc'), 'diverged');
+eq('classifyRel: no merge-base (unrelated) -> diverged', classifyRel('aaa', 'bbb', ''), 'diverged');
 
 // --- splitList / uniq -------------------------------------------------------
 eq('splitList: trims and drops empties', splitList('a, b ,,c'), ['a', 'b', 'c']);
