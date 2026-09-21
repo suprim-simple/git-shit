@@ -19,7 +19,7 @@
     "git-shit": "bin/git-shit.js"
   },
   "scripts": {
-    "test": "node test/pr-body.test.js && node test/publish.test.js && node test/sync.test.js && node test/stack.test.js && node test/list-ship-completion.test.js"
+    "test": "node test/pr-body.test.js && node test/publish.test.js && node test/sync.test.js && node test/stack.test.js && node test/list-ship-completion.test.js && node test/ship.test.js"
   },
   "files": [
     "bin"
