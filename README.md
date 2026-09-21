@@ -1,4 +1,4 @@
-# git-shit
+# Git-shit start, ship...
 
 [![CI](https://github.com/suprim-simple/git-shit/actions/workflows/ci.yml/badge.svg)](https://github.com/suprim-simple/git-shit/actions/workflows/ci.yml)
 
