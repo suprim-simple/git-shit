@@ -50,6 +50,8 @@ The default PR target is `staging`, but it's configurable — see [Configuration
 
 Runs `git flow feature start`. With `base`, the feature branches off `origin/<base>` (freshly fetched) instead of git-flow's default `develop` — e.g. `git-shit start my-fix production` for a fix that belongs on `production`. The base is remembered on the branch, so `ship`, `merge`-cleanup, `done`, and `status` all use it as this branch's default PR target instead of `staging` (an explicit argument still wins, e.g. `git-shit ship develop`).
 
+`git flow init` isn't required. In a repo where git-flow isn't initialised, `start` skips `git flow feature start` and creates the branch with a plain `git checkout -b` — off `origin/<base>` when you pass a base, off the `--on` parent when you stack, and otherwise off `origin/develop` (falling back to the default base, a local `develop`, then the current `HEAD`). Everything downstream (`ship`, `sync`, `merge`, `done`) already works without git-flow, so the whole workflow runs either way.
+
 With `--on=<parent>` it stacks the new branch on another **feature branch** instead of a long-lived base — see [Stacked PRs](#stacked-prs).
 
 ### Stacked PRs
@@ -73,7 +75,7 @@ git-shit ship                      # PR: feature/ui -> feature/api
 
 ### `ship [dest] [--draft] [--web] [--reviewer=…] [--label=…] [--assignee=…]`
 
-1. Verifies you have no uncommitted changes and that the destination branch (default: the base recorded by `start`, else `staging`) exists on `origin`. A `feature/*` branch is the normal case, but any branch can ship — off a `feature/*` branch it just prints a note and carries on (it only refuses to ship a branch into itself).
+1. Verifies you have no uncommitted changes and that the destination branch (default: the base recorded by `start`, else `staging`) exists on `origin`. A `feature/*` branch is the normal case, but any branch can ship — off a `feature/*` branch it just prints a note and carries on (it only refuses to ship a branch into itself). If the tree is dirty and you're in a terminal, `ship` shows the changes and offers to stage them all (`git add -A`) and commit them for you — it prints the `git status`, asks for confirmation, then prompts for a commit message and commits before continuing. Decline (or run non-interactively, e.g. in a script) and it falls back to the old behaviour: it stops and asks you to commit or stash first, without touching your tree.
 2. Publishes the branch — `git flow feature publish` for a `feature/*` branch in a git-flow-initialised repo, otherwise a plain `git push -u origin <branch>` — or just pushes if it's already on `origin`. So `ship` works even in a repo where you never ran `git flow init` (a `feature/*` branch there is just published with a plain push).
 3. Creates the PR:
    - **GitHub remote + `gh` logged in** — creates the PR from the terminal with `gh pr create`. The title and body come from the branch's commits: a single-commit branch uses that commit's subject and full message body, while a multi-commit branch uses the first commit's subject as the title and a bullet list of every commit subject as the body. If the repo has a [pull-request template](#pr-title-and-body), it's used as the body instead. If the branch already has an open PR, it just tells you (the push already updated it). `--draft` opens it as a draft; `--web` skips `gh` and forces the browser flow.
@@ -179,7 +181,7 @@ git config gitshit.assignees @me
 
 ## Requirements
 
-- git; [git-flow](https://www.gitkraken.com/learn/git/git-flow) is only needed for `git-shit start` — `ship`, `merge`, and `done` work without it. If you do use git-flow, initialise it with feature prefix `feature/` (`git flow init`)
+- git; [git-flow](https://www.gitkraken.com/learn/git/git-flow) is optional — every command, `start` included, works without it (`start` falls back to a plain `git checkout -b`). If you do use git-flow, initialise it with feature prefix `feature/` (`git flow init`) and `start`/`ship` will use it automatically
 - A Bitbucket or GitHub `origin` remote
 - Node.js >= 16
 - For terminal PRs on GitHub: the [GitHub CLI](https://cli.github.com) (`gh`), logged in via `gh auth login`

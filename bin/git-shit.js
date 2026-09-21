@@ -3,7 +3,9 @@
 // git-shit — git-flow feature workflow that ends in a PR into staging
 //
 // Workflow:
-//   1. git-shit start my-fix   -> runs `git flow feature start my-fix`
+//   1. git-shit start my-fix   -> runs `git flow feature start my-fix` (or,
+//                                  when git-flow isn't initialised, just
+//                                  `git checkout -b` off the origin base)
 //                                  (add a base to branch off something else,
 //                                   e.g. `git-shit start my-fix production` —
 //                                   the base then becomes this branch's
@@ -23,7 +25,10 @@
 //   Chrome menu bar -> View -> Developer -> Allow JavaScript from Apple Events
 //   (Without it, the tool still opens the PR page; you click Create yourself.)
 //
-// Requires: git. Only `start` needs git-flow; ship/merge/done work without it.
+// Requires: git. git-flow is optional — when it's initialised `start` uses it
+//           (and `ship` publishes with `git flow feature publish`); without it
+//           `start` branches with plain `git checkout -b` and `ship` pushes with
+//           `git push -u`, so the whole workflow runs either way.
 //           Terminal PRs need the GitHub CLI (`gh`, logged in); the browser
 //           fallback needs macOS + Google Chrome for the auto-click.
 //
@@ -45,6 +50,7 @@ const { execFileSync, spawnSync, spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const readline = require('readline');
 
 const BASE_BRANCH = 'staging';
 const PROG = 'git-shit';
@@ -125,6 +131,23 @@ function run(cmd, args) {
   const r = spawnSync(cmd, args, { stdio: 'inherit' });
   if (r.error && r.error.code === 'ENOENT') fail(`${cmd}: command not found`);
   if (r.status !== 0) process.exit(r.status == null ? 1 : r.status);
+}
+
+// Are we attached to an interactive terminal we can prompt on?
+function interactive() {
+  return !!(process.stdin.isTTY && process.stdout.isTTY);
+}
+
+// Ask a single line on the terminal and resolve with the trimmed reply. Only
+// call when interactive() is true.
+function ask(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(String(answer).trim());
+    });
+  });
 }
 
 function commandExists(cmd) {
@@ -240,6 +263,22 @@ function developStartBlock() {
   }
   const rel = classifyRel(git(['rev-parse', localRef]), git(['rev-parse', remoteRef]), mergeBase);
   return rel === 'behind' || rel === 'diverged' ? rel : '';
+}
+
+// Where a branch we create ourselves (git-flow not initialised, so no
+// `feature start` to lean on) begins from when `start` was given no explicit
+// base/parent. Prefer origin/<develop> to match what git-flow would branch off;
+// otherwise fall back to the default PR base on origin, then a local develop,
+// then the current HEAD — so `start` still works in a repo that has neither
+// git-flow nor a develop/staging branch yet. `base` is a parameter (defaulting
+// to defaultBase()) so tests can pin it without the memoised config lookup.
+function defaultStartPoint(develop, base = defaultBase()) {
+  const has = (ref) =>
+    spawnSync('git', ['show-ref', '--verify', '--quiet', ref], { stdio: 'ignore' }).status === 0;
+  if (has(`refs/remotes/origin/${develop}`)) return `origin/${develop}`;
+  if (base && base !== develop && has(`refs/remotes/origin/${base}`)) return `origin/${base}`;
+  if (has(`refs/heads/${develop}`)) return develop;
+  return 'HEAD';
 }
 
 // How to publish the current branch to origin. `git flow feature publish` only
@@ -665,8 +704,19 @@ function cmdStart(name, base, opts = {}) {
   // possibly stale local branch), and lands the identical branch git-flow would
   // once develop was reconciled.
   const develop = developBranch();
-  const block = developStartBlock();
-  if (block) {
+  const gfReady = gitflowInitialized();
+  const block = gfReady ? developStartBlock() : '';
+  if (!gfReady) {
+    // No `git flow init` in this repo — don't require it. Create the branch
+    // ourselves off the origin start point, the same way `ship` falls back to a
+    // plain push without git-flow. With a base/parent that's the start point;
+    // without one, defaultStartPoint picks the closest thing to git-flow's
+    // default (origin/<develop>, else the default base, else local develop/HEAD).
+    const startPoint = baseRef || defaultStartPoint(develop);
+    console.log(`==> git checkout -b ${branch} ${startPoint}`);
+    console.log(`    (git-flow isn't initialised here — branching off ${startPoint} directly.)`);
+    run('git', ['checkout', '-b', branch, startPoint]);
+  } else if (block) {
     const startPoint = baseRef || `origin/${develop}`;
     console.log(`==> git checkout -b ${branch} ${startPoint}`);
     console.log(
@@ -832,6 +882,32 @@ async function shipViaGh(branch, baseBranch, opts = {}) {
   console.log(`When it's ready, merge and clean up with: ${PROG} merge`);
 }
 
+// `ship` needs a clean tree. Rather than just refuse, offer to stage everything
+// (git add -A) and commit it in place so shipping can carry on — reading the
+// commit message from the terminal. Returns true when a commit was made (the
+// tree is now clean), false to fall back to the "commit or stash first" error
+// (declined, non-interactive, or an empty message). `-A` (not `git add .`) so
+// the whole repo is staged regardless of the cwd — otherwise the tree could
+// still be dirty after committing a subdirectory.
+async function offerCommitAndStage() {
+  if (!interactive()) return false; // no terminal to prompt on — keep the old behaviour
+  console.log('You have uncommitted changes:');
+  run('git', ['status', '--short']);
+  const yes = /^y(es)?$/i.test(await ask('Stage all changes (git add -A) and commit them before shipping? [y/N] '));
+  if (!yes) return false;
+  const msg = await ask('Commit message: ');
+  if (!msg) {
+    console.log('Empty commit message — nothing committed.');
+    return false;
+  }
+  console.log('==> git add -A');
+  run('git', ['add', '-A']);
+  console.log(`==> git commit -m "${msg.replace(/"/g, '\\"')}"`);
+  run('git', ['commit', '-m', msg]);
+  console.log('');
+  return true;
+}
+
 async function cmdShip(dest, opts = {}) {
   const repo = resolveRepo();
   const prefix = featurePrefix();
@@ -872,7 +948,10 @@ async function cmdShip(dest, opts = {}) {
   }
 
   if (git(['status', '--porcelain']) !== '') {
-    fail('You have uncommitted changes. Commit or stash them before shipping.');
+    const committed = await offerCommitAndStage();
+    if (!committed) {
+      fail('You have uncommitted changes. Commit or stash them before shipping.');
+    }
   }
 
   const featureName = isFeature ? branch.slice(prefix.length) : '';
@@ -1927,6 +2006,7 @@ module.exports = {
   prTemplate,
   defaultBase,
   gitflowInitialized,
+  defaultStartPoint,
   classifyRel,
   publishPlan,
   parseRepo,
