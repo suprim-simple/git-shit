@@ -66,6 +66,7 @@ const COMMANDS = [
   { name: 'done', desc: 'Clean up after the PR is merged' },
   { name: 'status', desc: 'Show branch, publish, and PR state' },
   { name: 'list', desc: 'List feature branches and their PRs' },
+  { name: 'issues', desc: 'Pick a GitHub issue and start a branch' },
   { name: 'completion', desc: 'Print a shell-completion script' },
   { name: 'help', desc: 'Show help' },
   { name: 'version', desc: 'Show the version' },
@@ -76,6 +77,7 @@ const FLAGS = {
   sync: ['--merge', '--rebase'],
   merge: ['--merge', '--squash', '--rebase', '--when-green'],
   list: ['--plain'],
+  issues: ['--plain', '--mine'],
 };
 
 // The default PR target when a branch has no base recorded by `start` and no
@@ -123,6 +125,17 @@ function configList(key) {
     return splitList(git(['config', key]));
   } catch {
     return [];
+  }
+}
+
+// A positive-integer git config read, e.g. gitshit.issuesPerPage. Returns 0 when
+// unset, non-numeric, or <= 0 (callers treat 0 as "not set").
+function configInt(key) {
+  try {
+    const n = parseInt(git(['config', key]), 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  } catch {
+    return 0;
   }
 }
 
@@ -304,6 +317,17 @@ function branchBase(branch) {
   }
 }
 
+// The GitHub issue number a branch was started from (recorded by `issues`),
+// used by `ship` to add a "Closes #<n>" line to the PR body. Cleared with the
+// branch, like gitshitbase. Empty when the branch wasn't started from an issue.
+function branchIssue(branch) {
+  try {
+    return git(['config', `branch.${branch}.gitshitissue`]);
+  } catch {
+    return '';
+  }
+}
+
 // --- GitHub CLI (gh) integration --------------------------------------------
 // When the origin remote is GitHub and `gh` is installed and logged in, PRs
 // are created and merged straight from the terminal — no browser hack needed.
@@ -446,6 +470,12 @@ Usage:
                          publish state, and live PR/checks/review state. In a
                          terminal it's an interactive board (↑/↓, o/c/s/m/r/q);
                          --plain (or piping) prints the static table.
+  ${PROG} issues [--plain] [--mine]
+                         Auto-refreshing board of open GitHub issues; Enter
+                         starts a branch for the selected issue (named
+                         <number>-<slug>) and links it so ship adds
+                         "Closes #<n>". --mine limits to issues assigned to
+                         you; --plain (or piping) prints a static table.
   ${PROG} completion <bash|zsh|fish>
                          Print a shell-completion script for the given shell
   ${PROG} help           Show this help    (also --help, -h)
@@ -820,6 +850,17 @@ function prTitleBody(base, branch) {
   return { title: title || branch, body };
 }
 
+// Append a "Closes #<n>" line to a PR body so merging the PR closes the linked
+// issue (GitHub honours the keyword). No-op when there's no issue or the body
+// already references it, so re-shipping doesn't stack duplicates. Exported for
+// tests.
+function withIssueClose(body, issueNum) {
+  if (!issueNum) return body || '';
+  if (new RegExp(`#${issueNum}(?!\\d)`).test(body || '')) return body || '';
+  const closer = `Closes #${issueNum}`;
+  return body ? `${body}\n\n${closer}` : closer;
+}
+
 // Build the `gh pr create` argument list. Reviewers/labels/assignees are each
 // passed as repeated flags (gh accepts one value per flag).
 function prCreateArgs({ base, head, title, body, draft, reviewers = [], labels = [], assignees = [] }) {
@@ -859,9 +900,12 @@ async function shipViaGh(branch, baseBranch, opts = {}) {
     console.log(`    ${existing.url}`);
   } else {
     const { title, body } = prTitleBody(baseBranch, branch);
+    const issueNum = branchIssue(branch);
+    const finalBody = withIssueClose(body, issueNum);
     const { reviewers, labels, assignees } = prPeople(opts);
 
     console.log(`==> Creating PR via gh: ${branch} -> ${baseBranch}${opts.draft ? ' (draft)' : ''}`);
+    if (issueNum) console.log(`    linking issue: Closes #${issueNum}`);
     if (reviewers.length) console.log(`    reviewers: ${reviewers.join(', ')}`);
     if (labels.length) console.log(`    labels: ${labels.join(', ')}`);
     if (assignees.length) console.log(`    assignees: ${assignees.join(', ')}`);
@@ -869,7 +913,7 @@ async function shipViaGh(branch, baseBranch, opts = {}) {
       base: baseBranch,
       head: branch,
       title: title || branch,
-      body,
+      body: finalBody,
       draft: opts.draft,
       reviewers,
       labels,
@@ -1609,7 +1653,7 @@ async function gatherListData(opts = {}) {
       spawnCapture('git', ['ls-remote', '--heads', 'origin']),
       ghAvailable
         ? ghJsonAsync([
-            'pr', 'list', '--state', 'all', '--limit', '200',
+            'pr', 'list', '--state', 'all', '--limit', '1',
             '--json', 'number,headRefName,baseRefName,state,isDraft,reviewDecision,statusCheckRollup,url',
           ])
         : Promise.resolve(null),
@@ -1825,6 +1869,310 @@ async function runBoard(initial) {
   }
 }
 
+// --- issues: pick a GitHub issue and start a branch for it -------------------
+// An auto-refreshing board of open issues (mirrors the `list` cockpit). Enter
+// starts a feature branch named "<number>-<slug>" for the selected issue and
+// records the issue number so `ship` links the PR with "Closes #<n>".
+
+const ISSUES_REFRESH_MS = 15000;
+// FETCH CAP — how many open issues to pull from GitHub per refresh (one gh call,
+// gh paginates internally up to it). This is NOT the page size: the board pages
+// through however many come back. Set it high enough to see all your issues;
+// past this, filter with --mine.
+const ISSUES_LIMIT = 200;
+// PAGE SIZE — issue rows per page in the board. 0 (the default) fills the
+// terminal height, like less/htop, and only pages when issues overflow the
+// screen. Set a fixed number to page that many at a time regardless of window
+// height — either edit this, or per-repo: git config gitshit.issuesPerPage <n>.
+const ISSUES_PAGE_SIZE = 0;
+
+// A git-branch-safe slug from an issue title: lowercased, runs of anything that
+// isn't a-z0-9 collapsed to a single dash, trimmed, and capped so the branch
+// name stays short. Exported for tests.
+function slugify(text, max = 40) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, max)
+    .replace(/-+$/g, '');
+}
+
+// The feature name (branch minus prefix) for an issue: "<number>-<slug>", or
+// just the number when the title has no usable characters. Exported for tests.
+function issueBranchName(issue) {
+  const slug = slugify(issue.title);
+  return slug ? `${issue.number}-${slug}` : String(issue.number);
+}
+
+// A compact "time ago" like git's relative dates: 3d, 5h, 12m, now. Exported
+// for tests.
+function relAge(iso) {
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return '';
+  const secs = Math.max(0, Math.floor((Date.now() - then) / 1000));
+  const units = [['y', 31536000], ['mo', 2592000], ['w', 604800], ['d', 86400], ['h', 3600], ['m', 60]];
+  for (const [u, s] of units) {
+    const n = Math.floor(secs / s);
+    if (n >= 1) return `${n}${u}`;
+  }
+  return 'now';
+}
+
+// Truncate with an ellipsis so long titles/labels don't blow out the columns.
+function trunc(s, n) {
+  s = String(s || '');
+  if (s.length <= n) return s;
+  return n <= 1 ? s.slice(0, n) : s.slice(0, n - 1) + '…';
+}
+
+// Flatten a gh issue JSON object into display cells.
+function issueRow(issue) {
+  const labels = (issue.labels || []).map((l) => l.name).filter(Boolean).join(',');
+  const who = (issue.assignees || []).map((a) => a.login).filter(Boolean).join(',');
+  return {
+    num: `#${issue.number}`,
+    title: issue.title || '',
+    labels,
+    who: who || '—',
+    age: relAge(issue.updatedAt),
+    issue,
+  };
+}
+
+// One `gh issue list` behind a spinner (quiet for the board's own redraw).
+async function gatherIssues(opts = {}) {
+  const repo = parseRepo(safeRemoteUrl());
+  if (!repo || repo.host !== 'github') {
+    fail(
+      `${PROG} issues needs a GitHub remote with the gh CLI.`,
+      repo
+        ? `origin is a ${repo.host} repo — issues are GitHub-only for now.`
+        : 'No github.com origin remote found.'
+    );
+  }
+  if (!ghUsable(repo)) {
+    fail(
+      `${PROG} issues needs the GitHub CLI (gh), logged in.`,
+      'Install it (https://cli.github.com), then: gh auth login'
+    );
+  }
+  const args = [
+    'issue', 'list', '--state', 'open', '--limit', String(ISSUES_LIMIT),
+    '--json', 'number,title,labels,assignees,updatedAt,url',
+  ];
+  if (opts.mine) args.push('--assignee', '@me');
+  const spin = opts.quiet ? (l, w) => w() : withSpinner;
+  const issues = await spin('Loading issues', () => ghJsonAsync(args));
+  return { repo, issues: Array.isArray(issues) ? issues : [] };
+}
+
+// Column layout shared by the static table and the board.
+function issueColumns(rows) {
+  return {
+    nw: Math.max('#'.length, ...rows.map((r) => r.num.length)),
+    tw: Math.min(64, Math.max('TITLE'.length, ...rows.map((r) => r.title.length))),
+    lw: Math.min(22, Math.max('LABELS'.length, ...rows.map((r) => r.labels.length))),
+    ww: Math.max('WHO'.length, ...rows.map((r) => r.who.length)),
+  };
+}
+
+function issueLine(r, c) {
+  return `${r.num.padEnd(c.nw)}  ${trunc(r.title, c.tw).padEnd(c.tw)}  ${trunc(r.labels, c.lw).padEnd(c.lw)}  ${trunc(r.who, c.ww).padEnd(c.ww)}  ${r.age}`.trimEnd();
+}
+
+// Static table (piped/redirected/--plain). Exported for tests.
+function renderIssues(rows) {
+  const c = issueColumns(rows);
+  const lines = [
+    `  ${'#'.padEnd(c.nw)}  ${'TITLE'.padEnd(c.tw)}  ${'LABELS'.padEnd(c.lw)}  ${'WHO'.padEnd(c.ww)}  AGE`,
+  ];
+  for (const r of rows) lines.push(`  ${issueLine(r, c)}`.trimEnd());
+  return lines;
+}
+
+// Resolve the next key press OR a timeout (for auto-refresh): resolves with the
+// key string, or null when `ms` elapses with no input.
+function readKeyOrTimeout(stdin, ms) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      stdin.removeListener('data', onData);
+      resolve(v);
+    };
+    const onData = (d) => finish(d);
+    const timer = setTimeout(() => finish(null), ms);
+    stdin.on('data', onData);
+  });
+}
+
+// Rows of vertical space the board's chrome takes (title, blank, column header,
+// blank, footer); the rest of the terminal height shows issues.
+const ISSUES_CHROME = 5;
+
+// How many issue rows to show per page. `override` (a fixed page size, 0 for
+// auto) is honoured up to what the terminal can actually fit — a page never
+// overflows the screen, and auto fills it. Re-read on every draw so it tracks
+// terminal resizes. Pure (given process.stdout.rows); exported for tests.
+function issuesPerPage(override = 0) {
+  const fit = Math.max(3, (process.stdout.rows || 24) - ISSUES_CHROME);
+  return override > 0 ? Math.min(override, fit) : fit;
+}
+
+// New top-of-window index that keeps the selection visible with the least
+// scrolling, clamped so the window never runs past the end of the list. Pure;
+// exported for tests.
+function scrollTop(sel, top, per, total) {
+  if (total <= per) return 0;
+  let t = top;
+  if (sel < t) t = sel; // selection scrolled above the window — pull it up
+  else if (sel >= t + per) t = sel - per + 1; // below — pull it down
+  return Math.max(0, Math.min(t, total - per)); // never show empty space past the end
+}
+
+// Draw only the [top, top+per) slice — building strings for the visible rows
+// only keeps redraws O(screen), not O(all issues). Column widths are measured
+// over the whole set so they don't jump around while you scroll.
+function drawIssuesBoard(rows, sel, top, per, ctx) {
+  const { reverse, dim, bold, reset } = ANSI;
+  const c = issueColumns(rows);
+  const total = rows.length;
+  const to = Math.min(total, top + per);
+  const synced = ctx.lastSync ? ctx.lastSync.toLocaleTimeString() : '';
+  const range = total > per ? ` · ${total ? top + 1 : 0}–${to} of ${total}` : '';
+  const out = [
+    `${bold}git-shit issues${reset}  ${dim}${total} open${ctx.mine ? ' · mine' : ''}${ctx.repo ? ` · ${ctx.repo.nwo}` : ''}${range}${synced ? ` · synced ${synced}` : ''}${reset}`,
+    '',
+    `  ${dim}${'#'.padEnd(c.nw)}  ${'TITLE'.padEnd(c.tw)}  ${'LABELS'.padEnd(c.lw)}  ${'WHO'.padEnd(c.ww)}  AGE${reset}`,
+  ];
+  for (let i = top; i < to; i++) {
+    const body = issueLine(rows[i], c);
+    out.push(i === sel ? `${reverse}  ${body}${reset}` : `  ${body}`);
+  }
+  out.push('');
+  out.push(
+    `${dim}↑/↓ move · PgUp/PgDn page · enter start · o open · a ${ctx.mine ? 'all' : 'mine'} · r refresh · q quit${reset}`
+  );
+  process.stdout.write(ANSI.clear + out.join('\r\n') + '\r\n');
+}
+
+// Create a feature branch for the selected issue and link it. Runs against the
+// real terminal (the board restores cooked mode before calling this).
+function startFromIssue(issue) {
+  const branch = `${featurePrefix()}${issueBranchName(issue)}`;
+  console.log(`Starting a branch for issue #${issue.number}: ${issue.title}`);
+  console.log('');
+  cmdStart(issueBranchName(issue));
+  run('git', ['config', `branch.${branch}.gitshitissue`, String(issue.number)]);
+  console.log('');
+  console.log(`Linked to issue #${issue.number} — ${PROG} ship will add "Closes #${issue.number}" to the PR.`);
+}
+
+async function runIssuesBoard(initial, opts) {
+  const repo = initial.repo;
+  let issues = initial.issues;
+  let rows = issues.map(issueRow);
+  let sel = 0;
+  let top = 0;
+  // Fixed page size (git config wins over the ISSUES_PAGE_SIZE constant),
+  // resolved once so redraws don't shell out to git config every frame.
+  const pageSize = configInt('gitshit.issuesPerPage') || ISSUES_PAGE_SIZE;
+  let per = issuesPerPage(pageSize);
+  let mine = !!opts.mine;
+  let lastSync = new Date();
+  let picked = null;
+
+  const stdin = process.stdin;
+  const restore = () => {
+    try { if (stdin.isTTY) stdin.setRawMode(false); } catch {}
+    stdin.pause();
+    process.stdout.write(ANSI.showCursor);
+  };
+  process.on('exit', restore);
+  const enterRaw = () => {
+    stdin.resume();
+    stdin.setEncoding('utf8');
+    try { stdin.setRawMode(true); } catch {}
+    process.stdout.write(ANSI.hideCursor);
+  };
+  const draw = () => {
+    per = issuesPerPage(pageSize);
+    top = scrollTop(sel, top, per, rows.length);
+    drawIssuesBoard(rows, sel, top, per, { repo, mine, lastSync });
+  };
+  const reload = async () => {
+    // Keep the cursor on the same issue across a refresh even if the list
+    // reordered or grew — track it by number, not by row position.
+    const selNum = rows[sel] && rows[sel].issue.number;
+    const data = await gatherIssues({ quiet: true, mine });
+    issues = data.issues;
+    rows = issues.map(issueRow);
+    const idx = rows.findIndex((r) => r.issue.number === selNum);
+    sel = idx >= 0 ? idx : Math.min(sel, rows.length - 1);
+    if (sel < 0) sel = 0;
+    lastSync = new Date();
+  };
+  // Redraw on terminal resize so the window tracks the new height.
+  const onResize = () => draw();
+  process.stdout.on('resize', onResize);
+
+  enterRaw();
+  draw();
+  try {
+    for (;;) {
+      const key = await readKeyOrTimeout(stdin, ISSUES_REFRESH_MS);
+      if (key === null) { await reload(); draw(); continue; } // auto-refresh tick
+      const r = rows[sel];
+      const last = rows.length - 1;
+      if (key === 'q' || key === '\x03' || key === '\x1b') break;
+      else if (key === 'j' || key === '\x1b[B') sel = Math.min(last, sel + 1);
+      else if (key === 'k' || key === '\x1b[A') sel = Math.max(0, sel - 1);
+      else if (key === '\x1b[6~' || key === ' ' || key === '\x06') { // PgDn / space / ^F
+        const maxTop = Math.max(0, rows.length - per);
+        const off = sel - top; // keep the cursor at the same screen row
+        top = Math.min(maxTop, top + per);
+        sel = Math.min(last, top + off);
+      } else if (key === '\x1b[5~' || key === '\x02') { // PgUp / ^B
+        const off = sel - top;
+        top = Math.max(0, top - per);
+        sel = Math.max(0, top + off);
+      }
+      else if (key === 'g' || key === '\x1b[H' || key === '\x1b[1~') sel = 0;
+      else if (key === 'G' || key === '\x1b[F' || key === '\x1b[4~') sel = Math.max(0, last);
+      else if (key === 'r') { process.stdout.write(`${ANSI.clear}Refreshing…`); await reload(); draw(); continue; }
+      else if (key === 'a') { mine = !mine; sel = 0; top = 0; process.stdout.write(`${ANSI.clear}Refreshing…`); await reload(); draw(); continue; }
+      else if (key === 'o' && r) { openUrl(r.issue.url); continue; }
+      else if ((key === '\r' || key === '\n') && r) { picked = r.issue; break; }
+      else continue; // ignore unknown keys without a redraw
+      draw();
+    }
+  } finally {
+    restore();
+    process.stdout.removeListener('resize', onResize);
+    process.removeListener('exit', restore);
+  }
+  // Start the branch after the board has released the terminal.
+  if (picked) startFromIssue(picked);
+}
+
+async function cmdIssues(opts = {}) {
+  const data = await gatherIssues(opts);
+  if (!data.issues.length) {
+    console.log(opts.mine ? 'No open issues assigned to you.' : 'No open issues.');
+    return;
+  }
+  // Interactive, auto-refreshing board in a terminal; static table when piped,
+  // redirected, or asked for with --plain (keeps `issues` scriptable).
+  if (!opts.plain && process.stdout.isTTY && process.stdin.isTTY) {
+    await runIssuesBoard(data, opts);
+    return;
+  }
+  for (const line of renderIssues(data.issues.map(issueRow))) console.log(line);
+}
+
 // --- completion: emit a shell-completion script -----------------------------
 
 function completionBash() {
@@ -1986,6 +2334,16 @@ async function main() {
       await cmdList(opts);
       break;
     }
+    case 'issues': {
+      const opts = {};
+      for (const f of flags) {
+        if (f === '--plain') opts.plain = true;
+        else if (f === '--mine') opts.mine = true;
+        else fail(`Unknown flag for issues: ${f}`, 'Use --plain for a static table, --mine for your issues.');
+      }
+      await cmdIssues(opts);
+      break;
+    }
     case 'completion':
       cmdCompletion(pos[0]);
       break;
@@ -2024,6 +2382,14 @@ module.exports = {
   buildListRows,
   branchLabel,
   renderList,
+  withIssueClose,
+  slugify,
+  issueBranchName,
+  relAge,
+  issueRow,
+  renderIssues,
+  scrollTop,
+  issuesPerPage,
   completionBash,
   completionZsh,
   completionFish,
