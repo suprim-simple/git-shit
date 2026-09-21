@@ -3,7 +3,9 @@
 // git-shit — git-flow feature workflow that ends in a PR into staging
 //
 // Workflow:
-//   1. git-shit start my-fix   -> runs `git flow feature start my-fix`
+//   1. git-shit start my-fix   -> runs `git flow feature start my-fix` (or,
+//                                  when git-flow isn't initialised, just
+//                                  `git checkout -b` off the origin base)
 //                                  (add a base to branch off something else,
 //                                   e.g. `git-shit start my-fix production` —
 //                                   the base then becomes this branch's
@@ -23,7 +25,10 @@
 //   Chrome menu bar -> View -> Developer -> Allow JavaScript from Apple Events
 //   (Without it, the tool still opens the PR page; you click Create yourself.)
 //
-// Requires: git. Only `start` needs git-flow; ship/merge/done work without it.
+// Requires: git. git-flow is optional — when it's initialised `start` uses it
+//           (and `ship` publishes with `git flow feature publish`); without it
+//           `start` branches with plain `git checkout -b` and `ship` pushes with
+//           `git push -u`, so the whole workflow runs either way.
 //           Terminal PRs need the GitHub CLI (`gh`, logged in); the browser
 //           fallback needs macOS + Google Chrome for the auto-click.
 //
@@ -45,6 +50,7 @@ const { execFileSync, spawnSync, spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const readline = require('readline');
 
 const BASE_BRANCH = 'staging';
 const PROG = 'git-shit';
@@ -127,6 +133,23 @@ function run(cmd, args) {
   if (r.status !== 0) process.exit(r.status == null ? 1 : r.status);
 }
 
+// Are we attached to an interactive terminal we can prompt on?
+function interactive() {
+  return !!(process.stdin.isTTY && process.stdout.isTTY);
+}
+
+// Ask a single line on the terminal and resolve with the trimmed reply. Only
+// call when interactive() is true.
+function ask(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(String(answer).trim());
+    });
+  });
+}
+
 function commandExists(cmd) {
   return spawnSync('command', ['-v', cmd], { shell: true, stdio: 'ignore' }).status === 0;
 }
@@ -191,6 +214,73 @@ function gitflowInitialized() {
   );
 }
 
+// git-flow's configured develop branch — what `feature start` branches off by
+// default and, the catch, insists is in sync with origin before it will start
+// *any* feature (see developStartBlock). Falls back to 'develop' when git-flow
+// isn't initialised.
+function developBranch() {
+  try {
+    return git(['config', 'gitflow.branch.develop']) || 'develop';
+  } catch {
+    return 'develop';
+  }
+}
+
+// Pure classification of ref A relative to ref B, given their tip SHAs and their
+// merge-base: 'same' | 'behind' | 'ahead' | 'diverged'. "behind" means A is an
+// ancestor of B (A can fast-forward up to B); "ahead" the reverse. An empty
+// merge-base means unrelated histories, which we treat as diverged. Exported
+// for tests.
+function classifyRel(aTip, bTip, mergeBase) {
+  if (aTip === bTip) return 'same';
+  if (!mergeBase) return 'diverged';
+  if (mergeBase === aTip) return 'behind';
+  if (mergeBase === bTip) return 'ahead';
+  return 'diverged';
+}
+
+// Would git-flow's `feature start` refuse to run because the local develop
+// branch has drifted from origin? git-flow checks develop against origin on
+// *every* feature start, no matter what base you pass, and dies when develop is
+// behind ("...may be fast-forwarded.") or has diverged ("Branches need merging
+// first.") — it only warns (and proceeds) when develop is ahead. Returns the
+// blocking relationship ('behind' | 'diverged') or '' when the gate wouldn't
+// fire. The gate only applies when both refs exist (git-flow guards its own
+// check on origin/<develop> existing, and a missing local develop is a
+// different, real error we shouldn't mask).
+function developStartBlock() {
+  const develop = developBranch();
+  const localRef = `refs/heads/${develop}`;
+  const remoteRef = `refs/remotes/origin/${develop}`;
+  const has = (ref) =>
+    spawnSync('git', ['show-ref', '--verify', '--quiet', ref], { stdio: 'ignore' }).status === 0;
+  if (!has(localRef) || !has(remoteRef)) return '';
+  let mergeBase = '';
+  try {
+    mergeBase = git(['merge-base', localRef, remoteRef]);
+  } catch {
+    mergeBase = ''; // unrelated histories
+  }
+  const rel = classifyRel(git(['rev-parse', localRef]), git(['rev-parse', remoteRef]), mergeBase);
+  return rel === 'behind' || rel === 'diverged' ? rel : '';
+}
+
+// Where a branch we create ourselves (git-flow not initialised, so no
+// `feature start` to lean on) begins from when `start` was given no explicit
+// base/parent. Prefer origin/<develop> to match what git-flow would branch off;
+// otherwise fall back to the default PR base on origin, then a local develop,
+// then the current HEAD — so `start` still works in a repo that has neither
+// git-flow nor a develop/staging branch yet. `base` is a parameter (defaulting
+// to defaultBase()) so tests can pin it without the memoised config lookup.
+function defaultStartPoint(develop, base = defaultBase()) {
+  const has = (ref) =>
+    spawnSync('git', ['show-ref', '--verify', '--quiet', ref], { stdio: 'ignore' }).status === 0;
+  if (has(`refs/remotes/origin/${develop}`)) return `origin/${develop}`;
+  if (base && base !== develop && has(`refs/remotes/origin/${base}`)) return `origin/${base}`;
+  if (has(`refs/heads/${develop}`)) return develop;
+  return 'HEAD';
+}
+
 // How to publish the current branch to origin. `git flow feature publish` only
 // works in a git-flow-initialised repo; everywhere else a plain upstream push
 // is the equivalent, so `ship` works with or without git-flow.
@@ -228,6 +318,14 @@ function ghUsable(repo) {
       spawnSync('gh', ['auth', 'status', '--hostname', 'github.com'], { stdio: 'ignore' })
         .status === 0;
   }
+  // Pin every `gh` call to the origin repo. Otherwise, in a repo with more than
+  // one remote (e.g. a fork with origin + upstream), gh can't decide which one
+  // to use and aborts with "No default remote repository has been set". GH_REPO
+  // is gh's env-var form of `--repo` and is inherited by every gh child process.
+  // git-shit already treats origin as canonical everywhere, so this just makes
+  // gh agree instead of guessing. Every `gh pr …` path is gated behind this
+  // function, so setting it here covers ship/merge/status/list/restack.
+  if (ghOk && repo.nwo) process.env.GH_REPO = repo.nwo;
   return ghOk;
 }
 
@@ -370,7 +468,7 @@ function parseRepo(remoteUrl) {
   const host = m[1] === 'github.com' ? 'github' : 'bitbucket';
   const workspace = m[2];
   const repoSlug = m[3].replace(/\.git$/, '');
-  return { host, web: `https://${m[1]}/${workspace}/${repoSlug}` };
+  return { host, nwo: `${workspace}/${repoSlug}`, web: `https://${m[1]}/${workspace}/${repoSlug}` };
 }
 
 // The origin remote as {host, web}; exits with guidance if it can't be parsed.
@@ -572,6 +670,8 @@ function cmdStart(name, base, opts = {}) {
     baseRef = parent;
     recordedBase = parent;
   } else if (base) {
+    // Remember the base: ship/sync/done/status default to it for this branch.
+    recordedBase = base;
     const baseOnOrigin =
       spawnSync('git', ['show-ref', '--verify', '--quiet', `refs/remotes/origin/${base}`], {
         stdio: 'ignore',
@@ -593,15 +693,51 @@ function cmdStart(name, base, opts = {}) {
     }
   }
 
-  console.log(`==> git flow feature start ${name}${baseRef ? ` ${baseRef}` : ''}`);
-  run('git', ['flow', 'feature', 'start', name, ...(baseRef ? [baseRef] : [])]);
+  // git-flow's `feature start` refuses to run while the local develop branch
+  // has drifted from origin (see developStartBlock) — even though we always
+  // branch off a freshly-fetched origin ref, which has nothing to do with
+  // develop's own hygiene. When that gate would block, create the branch
+  // ourselves off the origin start point and leave the user's local develop
+  // untouched. Off a base/parent the start point is that ref; for a plain start
+  // it's origin/<develop> — git-shit treats origin as canonical everywhere, so
+  // this matches what `start` prefers anyway (the fetched remote state over a
+  // possibly stale local branch), and lands the identical branch git-flow would
+  // once develop was reconciled.
+  const develop = developBranch();
+  const gfReady = gitflowInitialized();
+  const block = gfReady ? developStartBlock() : '';
+  if (!gfReady) {
+    // No `git flow init` in this repo — don't require it. Create the branch
+    // ourselves off the origin start point, the same way `ship` falls back to a
+    // plain push without git-flow. With a base/parent that's the start point;
+    // without one, defaultStartPoint picks the closest thing to git-flow's
+    // default (origin/<develop>, else the default base, else local develop/HEAD).
+    const startPoint = baseRef || defaultStartPoint(develop);
+    console.log(`==> git checkout -b ${branch} ${startPoint}`);
+    console.log(`    (git-flow isn't initialised here — branching off ${startPoint} directly.)`);
+    run('git', ['checkout', '-b', branch, startPoint]);
+  } else if (block) {
+    const startPoint = baseRef || `origin/${develop}`;
+    console.log(`==> git checkout -b ${branch} ${startPoint}`);
+    console.log(
+      `    (git-flow won't start a feature while local '${develop}' ` +
+        `${block === 'behind' ? 'is behind' : 'has diverged from'} origin/${develop};`
+    );
+    console.log(`     branching off ${startPoint} directly — local '${develop}' is left untouched.)`);
+    run('git', ['checkout', '-b', branch, startPoint]);
+  } else {
+    console.log(`==> git flow feature start ${name}${baseRef ? ` ${baseRef}` : ''}`);
+    run('git', ['flow', 'feature', 'start', name, ...(baseRef ? [baseRef] : [])]);
+  }
 
+  // Whichever way it was created, branching off a remote-tracking ref makes git
+  // set it as this branch's upstream — drop that so `git pull` / the Published
+  // check don't point at the base. (`git flow feature publish` sets the real
+  // upstream later.) Harmless no-op when no upstream was set (a plain start off
+  // the local develop branch).
+  spawnSync('git', ['branch', '--unset-upstream', branch], { stdio: 'ignore' });
   if (recordedBase) {
-    // Branching off another ref makes git track it as upstream — drop that so
-    // `git pull` / the Published check don't point at the base branch.
-    // (`git flow feature publish` sets the real upstream later.)
-    spawnSync('git', ['branch', '--unset-upstream', branch], { stdio: 'ignore' });
-    // Remember the base: ship/sync/done/status default to it for this branch.
+    // ship/sync/done/status default to this base for the branch.
     run('git', ['config', `branch.${branch}.gitshitbase`, recordedBase]);
   }
 
@@ -746,6 +882,32 @@ async function shipViaGh(branch, baseBranch, opts = {}) {
   console.log(`When it's ready, merge and clean up with: ${PROG} merge`);
 }
 
+// `ship` needs a clean tree. Rather than just refuse, offer to stage everything
+// (git add -A) and commit it in place so shipping can carry on — reading the
+// commit message from the terminal. Returns true when a commit was made (the
+// tree is now clean), false to fall back to the "commit or stash first" error
+// (declined, non-interactive, or an empty message). `-A` (not `git add .`) so
+// the whole repo is staged regardless of the cwd — otherwise the tree could
+// still be dirty after committing a subdirectory.
+async function offerCommitAndStage() {
+  if (!interactive()) return false; // no terminal to prompt on — keep the old behaviour
+  console.log('You have uncommitted changes:');
+  run('git', ['status', '--short']);
+  const yes = /^y(es)?$/i.test(await ask('Stage all changes (git add -A) and commit them before shipping? [y/N] '));
+  if (!yes) return false;
+  const msg = await ask('Commit message: ');
+  if (!msg) {
+    console.log('Empty commit message — nothing committed.');
+    return false;
+  }
+  console.log('==> git add -A');
+  run('git', ['add', '-A']);
+  console.log(`==> git commit -m "${msg.replace(/"/g, '\\"')}"`);
+  run('git', ['commit', '-m', msg]);
+  console.log('');
+  return true;
+}
+
 async function cmdShip(dest, opts = {}) {
   const repo = resolveRepo();
   const prefix = featurePrefix();
@@ -786,7 +948,10 @@ async function cmdShip(dest, opts = {}) {
   }
 
   if (git(['status', '--porcelain']) !== '') {
-    fail('You have uncommitted changes. Commit or stash them before shipping.');
+    const committed = await offerCommitAndStage();
+    if (!committed) {
+      fail('You have uncommitted changes. Commit or stash them before shipping.');
+    }
   }
 
   const featureName = isFeature ? branch.slice(prefix.length) : '';
@@ -1841,6 +2006,8 @@ module.exports = {
   prTemplate,
   defaultBase,
   gitflowInitialized,
+  defaultStartPoint,
+  classifyRel,
   publishPlan,
   parseRepo,
   splitList,
