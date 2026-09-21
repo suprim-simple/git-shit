@@ -39,6 +39,8 @@ git-shit merge --squash  # same, squash-merged (also: --rebase)
 git-shit merge --when-green  # wait for checks to pass, then merge + notify
 git-shit done            # cleanup only: checkout the base, pull, delete branch, prune
 git-shit list            # interactive board of every feature/* branch (--plain for a static table)
+git-shit issues          # auto-refreshing board of open GitHub issues; Enter starts a branch for one
+git-shit issues --mine   # same, limited to issues assigned to you
 git-shit completion zsh  # print a shell-completion script (also: bash, fish)
 git-shit help            # show usage (also --help, -h)
 git-shit version         # show version (also --version, -v)
@@ -144,6 +146,45 @@ A dashboard of **all** your in-flight work — every local `feature/*` branch at
 Pass `--plain` (or pipe/redirect the output) for the static table above — that's what scripts and non-terminals get automatically.
 
 One `git ls-remote` (publish state) and one `gh pr list` (PR state) back the whole table; they run **in parallel behind a progress spinner**, so the wait is the slower of the two (not their sum) and you always see it's working. `status`, `ship`, and `merge` show the same spinner while they talk to GitHub. On Bitbucket, or without `gh`, the PR columns are omitted.
+
+### `issues [--plain] [--mine]` (GitHub + gh)
+
+Pick the issue you're about to work on and start a branch for it — without leaving the terminal. `issues` shows an **auto-refreshing** board of the repo's open issues (number, title, labels, assignee, age), polled every 15s so it stays current while it sits open, and on selection it runs `start` for you.
+
+```
+git-shit issues  ·  2 open · acme/widgets · synced 1:53:36 PM
+
+  #     TITLE                      LABELS  WHO            AGE
+  #123  Fix the flaky login test!  bug     suprim-simple  18h
+  #124  Add dark mode                      —              now
+
+↑/↓ move · enter start branch · o open · a mine · r refresh · q quit
+```
+
+| key | action |
+|-----|--------|
+| ↑/↓ (or `j`/`k`) | move the selection |
+| PgUp/PgDn (or Space / `Ctrl-B`/`Ctrl-F`) | page a screenful at a time |
+| `g` / `G` | jump to the first / last issue |
+| Enter | **start a branch** for the selected issue and link it (then exit the board) |
+| `o` | open the issue in the browser |
+| `a` | toggle between all open issues and just yours |
+| `r` | refresh now |
+| `q` | quit |
+
+**Enter** starts a feature branch named `<number>-<slug-of-title>` (e.g. `feature/123-fix-the-flaky-login-test`) off your default base, and records the issue number on the branch. That link means the next **`git-shit ship`** appends `Closes #123` to the PR body, so merging the PR closes the issue automatically (unless the body already references it). `--mine` starts the board filtered to issues assigned to you; `--plain` (or piping) prints the static table for scripts.
+
+**Big backlogs.** The board only renders the rows that fit your terminal and pages through the rest, so it stays fast and legible no matter how many issues are open (it resizes with the window, and keeps your cursor on the same issue across auto-refreshes). One `gh` call fetches up to 200 open issues per refresh; beyond that, narrow with `--mine`.
+
+By default a "page" is however many issues fit your terminal height. To page a **fixed** number at a time instead — regardless of window size — set a page size:
+
+```sh
+git config gitshit.issuesPerPage 10   # page 10 issues at a time
+```
+
+(The fetch cap and the page size are separate: the cap is how many issues are pulled from GitHub, the page size is how many show per screen.)
+
+Needs a GitHub remote with `gh` logged in — it's GitHub-only for now.
 
 ### `completion <bash|zsh|fish>`
 
