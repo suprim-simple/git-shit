@@ -61,6 +61,8 @@ const { version: VERSION } = require('../package.json');
 const COMMANDS = [
   { name: 'start', desc: 'Start a new git-flow feature' },
   { name: 'ship', desc: 'Push the branch and open a PR' },
+  { name: 'push', desc: 'Push the current branch (commit dirty changes first)' },
+  { name: 'pull', desc: 'Pull the current branch from origin' },
   { name: 'sync', desc: 'Catch the branch up to its base' },
   { name: 'merge', desc: 'Merge the open PR, then clean up' },
   { name: 'done', desc: 'Clean up after the PR is merged' },
@@ -74,6 +76,8 @@ const COMMANDS = [
 const FLAGS = {
   start: ['--on='],
   ship: ['--draft', '--web', '--reviewer=', '--label=', '--assignee='],
+  push: ['--force'],
+  pull: ['--rebase'],
   sync: ['--merge', '--rebase'],
   merge: ['--merge', '--squash', '--rebase', '--when-green'],
   list: ['--plain'],
@@ -451,6 +455,14 @@ Usage:
                          gh: opens the PR page in Chrome and auto-clicks Create.
                          Reviewers/labels/assignees also come from git config
                          (gitshit.reviewers/labels/assignees).
+  ${PROG} push [--force] Push the current branch to origin (sets the upstream on
+                         the first push). Dirty tree? It offers to stage all
+                         changes (git add -A) and commit them first, like ship —
+                         decline and it pushes committed work only. --force uses
+                         --force-with-lease (safe after a rebase).
+  ${PROG} pull [--rebase]
+                         Pull the current branch from origin (--rebase to rebase
+                         instead of merge). Refuses on a dirty tree.
   ${PROG} sync [dest] [--merge]
                          Catch the current branch up to its base: fetch, then
                          rebase (or --merge) origin/<base> into it (default:
@@ -933,11 +945,11 @@ async function shipViaGh(branch, baseBranch, opts = {}) {
 // (declined, non-interactive, or an empty message). `-A` (not `git add .`) so
 // the whole repo is staged regardless of the cwd — otherwise the tree could
 // still be dirty after committing a subdirectory.
-async function offerCommitAndStage() {
+async function offerCommitAndStage(action = 'shipping') {
   if (!interactive()) return false; // no terminal to prompt on — keep the old behaviour
   console.log('You have uncommitted changes:');
   run('git', ['status', '--short']);
-  const yes = /^y(es)?$/i.test(await ask('Stage all changes (git add -A) and commit them before shipping? [y/N] '));
+  const yes = /^y(es)?$/i.test(await ask(`Stage all changes (git add -A) and commit them before ${action}? [y/N] `));
   if (!yes) return false;
   const msg = await ask('Commit message: ');
   if (!msg) {
@@ -950,6 +962,74 @@ async function offerCommitAndStage() {
   run('git', ['commit', '-m', msg]);
   console.log('');
   return true;
+}
+
+// Does the current branch have an upstream configured (so a bare `git push`/
+// `git pull` knows where to go)?
+function hasUpstream() {
+  return (
+    spawnSync('git', ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'], {
+      stdio: 'ignore',
+    }).status === 0
+  );
+}
+
+// Push the current branch to origin. Like `ship`, a dirty tree first triggers
+// the offer to stage-all (git add -A) and commit — but `push` opens no PR and,
+// if you decline, still pushes whatever is already committed. Sets the upstream
+// on the first push; --force uses --force-with-lease (safe after a rebase).
+async function cmdPush(opts = {}) {
+  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
+  if (branch === 'HEAD') {
+    fail('You are in a detached HEAD — check out a branch before pushing.');
+  }
+
+  if (git(['status', '--porcelain']) !== '') {
+    const committed = await offerCommitAndStage('pushing');
+    if (!committed) {
+      console.log('Note: uncommitted changes left in your working tree — pushing committed work only.');
+    }
+  }
+
+  const force = opts.force ? ['--force-with-lease'] : [];
+  if (hasUpstream()) {
+    console.log(`==> git push${opts.force ? ' --force-with-lease' : ''}`);
+    run('git', ['push', ...force]);
+  } else {
+    console.log(`==> git push -u origin ${branch}${opts.force ? ' --force-with-lease' : ''}`);
+    run('git', ['push', ...force, '-u', 'origin', branch]);
+  }
+}
+
+// Pull the current branch from origin: fast-forward/merge, or --rebase. Refuses
+// on a dirty tree (a pull that has to merge needs a clean one), matching `sync`.
+function cmdPull(opts = {}) {
+  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
+  if (branch === 'HEAD') {
+    fail('You are in a detached HEAD — check out a branch before pulling.');
+  }
+  if (git(['status', '--porcelain']) !== '') {
+    fail('You have uncommitted changes. Commit or stash them before pulling.');
+  }
+
+  const strat = opts.rebase ? ['--rebase'] : [];
+  if (hasUpstream()) {
+    console.log(`==> git pull${opts.rebase ? ' --rebase' : ''}`);
+    run('git', ['pull', ...strat]);
+  } else {
+    const onOrigin =
+      spawnSync('git', ['ls-remote', '--exit-code', '--heads', 'origin', branch], {
+        stdio: 'ignore',
+      }).status === 0;
+    if (!onOrigin) {
+      fail(
+        `'${branch}' has no upstream and isn't on origin yet.`,
+        `Publish it first with: ${PROG} push`
+      );
+    }
+    console.log(`==> git pull${opts.rebase ? ' --rebase' : ''} origin ${branch}`);
+    run('git', ['pull', ...strat, 'origin', branch]);
+  }
 }
 
 async function cmdShip(dest, opts = {}) {
@@ -2292,6 +2372,24 @@ async function main() {
         else fail(`Unknown flag for ship: ${f}`, 'Use --reviewer=a,b / --label=x / --assignee=@me (with =).');
       }
       await cmdShip(pos[0], opts);
+      break;
+    }
+    case 'push': {
+      const opts = {};
+      for (const f of flags) {
+        if (f === '--force') opts.force = true;
+        else fail(`Unknown flag for push: ${f}`, 'Use --force for a safe force-push (--force-with-lease).');
+      }
+      await cmdPush(opts);
+      break;
+    }
+    case 'pull': {
+      const opts = {};
+      for (const f of flags) {
+        if (f === '--rebase') opts.rebase = true;
+        else fail(`Unknown flag for pull: ${f}`, 'Use --rebase to rebase instead of merge.');
+      }
+      cmdPull(opts);
       break;
     }
     case 'sync': {

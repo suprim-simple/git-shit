@@ -30,6 +30,9 @@ git-shit sync --merge    # same, but merge the base in instead of rebasing
 git-shit ship            # pushes the branch and opens a PR into the base (default: staging)
 git-shit ship develop    # same, but the PR targets `develop` instead
 git-shit ship --draft    # create the PR as a draft (GitHub + gh only)
+git-shit push            # push the current branch (offers to commit a dirty tree first)
+git-shit push --force    # same, with --force-with-lease (safe after a rebase)
+git-shit pull            # pull the current branch from origin (--rebase to rebase)
 git-shit merge           # merge the open PR from the terminal, then clean up
 git-shit merge --squash  # same, squash-merged (also: --rebase)
 git-shit merge --when-green  # wait for checks to pass, then merge + notify
@@ -90,6 +93,16 @@ When creating a PR with `gh`, `git-shit` fills the title and body from the commi
 - **Pull-request template** — if the repo has one (`.github/pull_request_template.md`, `PULL_REQUEST_TEMPLATE.md`, `docs/…`, and the usual variants), its contents become the body so your team's checklist/format is preserved; the title still comes from the commits.
 
 Either way it's just the starting point — edit the PR on GitHub afterwards if you want. (The Bitbucket/browser fallback only pre-fills the title.)
+
+### `push [--force]`
+
+Plain `git push` for the current branch, with the same dirty-tree convenience as `ship` but no PR. If the working tree is dirty and you're in a terminal, it shows the changes and offers to stage them all (`git add -A`) and commit them — printing `git status`, asking to confirm, then prompting for a commit message — before pushing. Decline (or run non-interactively) and it just pushes whatever is already committed, leaving your working tree untouched (it says so). It sets the upstream automatically on the first push, so a later bare `push`/`pull` just works. `--force` uses `--force-with-lease` — the safe force-push you want after a rebase.
+
+Unlike `ship`, `push` opens no PR and needs no `gh`/GitHub — it works on any remote.
+
+### `pull [--rebase]`
+
+Plain `git pull` for the current branch (fast-forward/merge, or `--rebase` to rebase your local commits on top instead). Refuses on a dirty tree — commit or stash first — since a pull that has to merge needs a clean one. If the branch has no upstream yet, it pulls from `origin/<branch>` when that exists, or tells you to `git-shit push` it first.
 
 ### `sync [dest] [--merge]`
 
