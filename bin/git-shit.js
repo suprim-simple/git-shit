@@ -76,7 +76,7 @@ const COMMANDS = [
 ];
 const FLAGS = {
   start: ['--on='],
-  checkout: ['--plain'],
+  checkout: ['--plain', '--no-pull'],
   ship: ['--draft', '--web', '--reviewer=', '--label=', '--assignee='],
   push: ['--force'],
   pull: ['--rebase'],
@@ -447,11 +447,13 @@ Usage:
                          this branch. With --on=<parent>, stack it on another
                          feature branch: its PR targets <parent>, and when
                          <parent> merges this branch is restacked automatically.
-  ${PROG} checkout [name] [--plain]
-                         Switch branches. With a name, checks it out directly
-                         (falling back to ${featurePrefix()}<name>). With no
-                         name, opens an interactive list of local branches —
-                         pick one to check out (--plain prints a static table).
+  ${PROG} checkout [name] [--plain] [--no-pull]
+                         Switch branches, then fast-forward to the latest from
+                         origin (--no-pull to skip that). With a name, checks it
+                         out directly (falling back to ${featurePrefix()}<name>).
+                         With no name, opens an interactive list of local
+                         branches — pick one to check out, r to refresh the list
+                         (--plain prints a static table).
   ${PROG} ship [dest] [--draft] [--web]
        [--reviewer=a,b] [--label=x] [--assignee=@me]
                          Push current feature and open a PR against dest
@@ -2329,11 +2331,31 @@ function drawCheckoutBoard(rows, sel, top, per) {
     out.push(i === sel ? `${reverse}${body}${reset}` : body);
   }
   out.push('');
-  out.push(`${dim}↑/↓ move · PgUp/PgDn page · enter checkout · q quit${reset}`);
+  out.push(`${dim}↑/↓ move · PgUp/PgDn page · enter checkout · r refresh · q quit${reset}`);
   process.stdout.write(ANSI.clear + out.join('\r\n') + '\r\n');
 }
 
-async function runCheckoutBoard(rows) {
+// After a checkout, fast-forward the branch to its upstream so you land on the
+// latest. --ff-only never merges or conflicts: it updates when it cleanly can,
+// otherwise it says so and leaves your tree alone. No upstream -> nothing to do.
+function pullFastForward(branch) {
+  if (!hasUpstream()) return;
+  console.log('==> git pull --ff-only');
+  const r = spawnSync('git', ['pull', '--ff-only'], { stdio: 'inherit' });
+  if (r.status !== 0) {
+    console.log(`    (couldn't fast-forward '${branch}' — it may have diverged; run \`${PROG} sync\` or \`${PROG} pull\`)`);
+  }
+}
+
+// Check out a branch and, unless pull is false, pull its latest (fast-forward).
+function switchTo(branch, pull) {
+  console.log(`==> git checkout ${branch}`);
+  run('git', ['checkout', branch]);
+  if (pull) pullFastForward(branch);
+}
+
+async function runCheckoutBoard(initialRows, opts = {}) {
+  let rows = initialRows;
   let sel = Math.max(0, rows.findIndex((r) => r.current));
   let top = 0;
   let per = checkoutPerPage();
@@ -2359,6 +2381,17 @@ async function runCheckoutBoard(rows) {
   };
   const onResize = () => draw();
   process.stdout.on('resize', onResize);
+  // Refresh the list: fetch origin, then re-read local branches, keeping the
+  // cursor on the same branch by name.
+  const reload = () => {
+    process.stdout.write(`${ANSI.clear}Refreshing…`);
+    spawnSync('git', ['fetch', '--prune', 'origin'], { stdio: 'ignore' });
+    const selBranch = rows[sel] && rows[sel].branch;
+    rows = gatherBranches();
+    const idx = rows.findIndex((r) => r.branch === selBranch);
+    sel = idx >= 0 ? idx : Math.min(sel, rows.length - 1);
+    if (sel < 0) sel = 0;
+  };
 
   enterRaw();
   draw();
@@ -2380,6 +2413,7 @@ async function runCheckoutBoard(rows) {
         sel = Math.max(0, top + off);
       } else if (key === 'g' || key === '\x1b[H' || key === '\x1b[1~') sel = 0;
       else if (key === 'G' || key === '\x1b[F' || key === '\x1b[4~') sel = last;
+      else if (key === 'r') { reload(); draw(); continue; }
       else if ((key === '\r' || key === '\n') && rows[sel]) { picked = rows[sel]; break; }
       else continue;
       draw();
@@ -2389,25 +2423,25 @@ async function runCheckoutBoard(rows) {
     process.stdout.removeListener('resize', onResize);
     process.removeListener('exit', restore);
   }
-  // Check out after the board has released the terminal.
+  // Check out after the board has released the terminal (and pull its latest,
+  // unless --no-pull was passed).
   if (picked) {
     if (picked.current) {
       console.log(`Already on '${picked.branch}'.`);
       return;
     }
-    console.log(`==> git checkout ${picked.branch}`);
-    run('git', ['checkout', picked.branch]);
+    switchTo(picked.branch, opts.pull !== false);
   }
 }
 
 async function cmdCheckout(name, opts = {}) {
+  const pull = opts.pull !== false; // default: pull latest after checkout
   if (name) {
     // Direct switch, like git: exact name, else feature/<name>.
     const prefix = featurePrefix();
     let target = name;
     if (!localBranchExists(name) && localBranchExists(`${prefix}${name}`)) target = `${prefix}${name}`;
-    console.log(`==> git checkout ${target}`);
-    run('git', ['checkout', target]);
+    switchTo(target, pull);
     return;
   }
   const rows = gatherBranches();
@@ -2417,7 +2451,7 @@ async function cmdCheckout(name, opts = {}) {
   }
   // Interactive picker in a terminal; static table when piped/redirected/--plain.
   if (!opts.plain && process.stdout.isTTY && process.stdin.isTTY) {
-    await runCheckoutBoard(rows);
+    await runCheckoutBoard(rows, { pull });
     return;
   }
   for (const line of renderBranches(rows)) console.log(line);
@@ -2535,7 +2569,8 @@ async function main() {
       const opts = {};
       for (const f of flags) {
         if (f === '--plain') opts.plain = true;
-        else fail(`Unknown flag for checkout: ${f}`, 'Use --plain for a static list.');
+        else if (f === '--no-pull') opts.pull = false;
+        else fail(`Unknown flag for checkout: ${f}`, 'Use --plain for a static list, --no-pull to skip the pull.');
       }
       await cmdCheckout(pos[0], opts);
       break;
