@@ -60,6 +60,7 @@ const { version: VERSION } = require('../package.json');
 // are generated from, so completions never drift from what the CLI accepts.
 const COMMANDS = [
   { name: 'start', desc: 'Start a new git-flow feature' },
+  { name: 'checkout', desc: 'Check out a branch (interactive list)' },
   { name: 'ship', desc: 'Push the branch and open a PR' },
   { name: 'push', desc: 'Push the current branch (commit dirty changes first)' },
   { name: 'pull', desc: 'Pull the current branch from origin' },
@@ -75,6 +76,7 @@ const COMMANDS = [
 ];
 const FLAGS = {
   start: ['--on='],
+  checkout: ['--plain'],
   ship: ['--draft', '--web', '--reviewer=', '--label=', '--assignee='],
   push: ['--force'],
   pull: ['--rebase'],
@@ -445,6 +447,11 @@ Usage:
                          this branch. With --on=<parent>, stack it on another
                          feature branch: its PR targets <parent>, and when
                          <parent> merges this branch is restacked automatically.
+  ${PROG} checkout [name] [--plain]
+                         Switch branches. With a name, checks it out directly
+                         (falling back to ${featurePrefix()}<name>). With no
+                         name, opens an interactive list of local branches —
+                         pick one to check out (--plain prints a static table).
   ${PROG} ship [dest] [--draft] [--web]
        [--reviewer=a,b] [--label=x] [--assignee=@me]
                          Push current feature and open a PR against dest
@@ -2253,6 +2260,169 @@ async function cmdIssues(opts = {}) {
   for (const line of renderIssues(data.issues.map(issueRow))) console.log(line);
 }
 
+// --- checkout: pick a local branch to switch to -----------------------------
+// A branch picker: `checkout` with no argument opens a board of local branches
+// (most-recently-committed first) and checks out the one you pick; `checkout
+// <name>` switches directly, like git (falling back to feature/<name>).
+
+// Parse `git for-each-ref` output (tab-separated: name, HEAD-marker, rel-date,
+// subject) into display rows. Pure; exported for tests.
+function parseBranches(out) {
+  return String(out || '')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => {
+      const parts = line.split('\t');
+      return {
+        branch: parts[0],
+        current: parts[1] === '*',
+        age: parts[2] || '',
+        subject: parts.slice(3).join('\t') || '',
+      };
+    });
+}
+
+// Local branches, most-recently-committed first, with the current one marked.
+function gatherBranches() {
+  return parseBranches(
+    git([
+      'for-each-ref', '--sort=-committerdate', 'refs/heads',
+      '--format=%(refname:short)%09%(HEAD)%09%(committerdate:relative)%09%(contents:subject)',
+    ])
+  );
+}
+
+// Static table (piped/redirected/--plain). Exported for tests.
+function renderBranches(rows) {
+  const bw = Math.max('BRANCH'.length, ...rows.map((r) => r.branch.length));
+  const aw = Math.max('AGE'.length, ...rows.map((r) => r.age.length));
+  const sw = Math.min(50, Math.max('LAST COMMIT'.length, ...rows.map((r) => r.subject.length)));
+  const lines = [`  ${'BRANCH'.padEnd(bw)}  ${'AGE'.padEnd(aw)}  LAST COMMIT`];
+  for (const r of rows) {
+    lines.push(`${r.current ? '*' : ' '} ${r.branch.padEnd(bw)}  ${r.age.padEnd(aw)}  ${trunc(r.subject, sw)}`.trimEnd());
+  }
+  return lines;
+}
+
+// Rows that fit on screen (same chrome as the issues board: title, blank,
+// header, blank, footer).
+function checkoutPerPage() {
+  return Math.max(3, (process.stdout.rows || 24) - ISSUES_CHROME);
+}
+
+function drawCheckoutBoard(rows, sel, top, per) {
+  const { reverse, dim, bold, reset } = ANSI;
+  const total = rows.length;
+  const to = Math.min(total, top + per);
+  const bw = Math.max('BRANCH'.length, ...rows.map((r) => r.branch.length));
+  const aw = Math.max('AGE'.length, ...rows.map((r) => r.age.length));
+  const sw = Math.min(50, Math.max('LAST COMMIT'.length, ...rows.map((r) => r.subject.length)));
+  const range = total > per ? ` · ${top + 1}–${to} of ${total}` : '';
+  const out = [
+    `${bold}git-shit checkout${reset}  ${dim}${total} branch(es)${range}${reset}`,
+    '',
+    `  ${dim}${'BRANCH'.padEnd(bw)}  ${'AGE'.padEnd(aw)}  LAST COMMIT${reset}`,
+  ];
+  for (let i = top; i < to; i++) {
+    const r = rows[i];
+    const body = `${r.current ? '*' : ' '} ${r.branch.padEnd(bw)}  ${r.age.padEnd(aw)}  ${trunc(r.subject, sw)}`.trimEnd();
+    out.push(i === sel ? `${reverse}${body}${reset}` : body);
+  }
+  out.push('');
+  out.push(`${dim}↑/↓ move · PgUp/PgDn page · enter checkout · q quit${reset}`);
+  process.stdout.write(ANSI.clear + out.join('\r\n') + '\r\n');
+}
+
+async function runCheckoutBoard(rows) {
+  let sel = Math.max(0, rows.findIndex((r) => r.current));
+  let top = 0;
+  let per = checkoutPerPage();
+  let picked = null;
+
+  const stdin = process.stdin;
+  const restore = () => {
+    try { if (stdin.isTTY) stdin.setRawMode(false); } catch {}
+    stdin.pause();
+    process.stdout.write(ANSI.showCursor);
+  };
+  process.on('exit', restore);
+  const enterRaw = () => {
+    stdin.resume();
+    stdin.setEncoding('utf8');
+    try { stdin.setRawMode(true); } catch {}
+    process.stdout.write(ANSI.hideCursor);
+  };
+  const draw = () => {
+    per = checkoutPerPage();
+    top = scrollTop(sel, top, per, rows.length);
+    drawCheckoutBoard(rows, sel, top, per);
+  };
+  const onResize = () => draw();
+  process.stdout.on('resize', onResize);
+
+  enterRaw();
+  draw();
+  try {
+    for (;;) {
+      const key = await readKey(stdin);
+      const last = rows.length - 1;
+      if (key === 'q' || key === '\x03' || key === '\x1b') break;
+      else if (key === 'j' || key === '\x1b[B') sel = Math.min(last, sel + 1);
+      else if (key === 'k' || key === '\x1b[A') sel = Math.max(0, sel - 1);
+      else if (key === '\x1b[6~' || key === ' ' || key === '\x06') { // PgDn / space / ^F
+        const maxTop = Math.max(0, rows.length - per);
+        const off = sel - top;
+        top = Math.min(maxTop, top + per);
+        sel = Math.min(last, top + off);
+      } else if (key === '\x1b[5~' || key === '\x02') { // PgUp / ^B
+        const off = sel - top;
+        top = Math.max(0, top - per);
+        sel = Math.max(0, top + off);
+      } else if (key === 'g' || key === '\x1b[H' || key === '\x1b[1~') sel = 0;
+      else if (key === 'G' || key === '\x1b[F' || key === '\x1b[4~') sel = last;
+      else if ((key === '\r' || key === '\n') && rows[sel]) { picked = rows[sel]; break; }
+      else continue;
+      draw();
+    }
+  } finally {
+    restore();
+    process.stdout.removeListener('resize', onResize);
+    process.removeListener('exit', restore);
+  }
+  // Check out after the board has released the terminal.
+  if (picked) {
+    if (picked.current) {
+      console.log(`Already on '${picked.branch}'.`);
+      return;
+    }
+    console.log(`==> git checkout ${picked.branch}`);
+    run('git', ['checkout', picked.branch]);
+  }
+}
+
+async function cmdCheckout(name, opts = {}) {
+  if (name) {
+    // Direct switch, like git: exact name, else feature/<name>.
+    const prefix = featurePrefix();
+    let target = name;
+    if (!localBranchExists(name) && localBranchExists(`${prefix}${name}`)) target = `${prefix}${name}`;
+    console.log(`==> git checkout ${target}`);
+    run('git', ['checkout', target]);
+    return;
+  }
+  const rows = gatherBranches();
+  if (!rows.length) {
+    console.log('No local branches.');
+    return;
+  }
+  // Interactive picker in a terminal; static table when piped/redirected/--plain.
+  if (!opts.plain && process.stdout.isTTY && process.stdin.isTTY) {
+    await runCheckoutBoard(rows);
+    return;
+  }
+  for (const line of renderBranches(rows)) console.log(line);
+}
+
 // --- completion: emit a shell-completion script -----------------------------
 
 function completionBash() {
@@ -2359,6 +2529,15 @@ async function main() {
         else fail(`Unknown flag for start: ${f}`, 'Use --on=<parent> to stack on another feature branch.');
       }
       cmdStart(pos[0], pos[1], opts);
+      break;
+    }
+    case 'checkout': {
+      const opts = {};
+      for (const f of flags) {
+        if (f === '--plain') opts.plain = true;
+        else fail(`Unknown flag for checkout: ${f}`, 'Use --plain for a static list.');
+      }
+      await cmdCheckout(pos[0], opts);
       break;
     }
     case 'ship': {
@@ -2488,6 +2667,8 @@ module.exports = {
   renderIssues,
   scrollTop,
   issuesPerPage,
+  parseBranches,
+  renderBranches,
   completionBash,
   completionZsh,
   completionFish,
