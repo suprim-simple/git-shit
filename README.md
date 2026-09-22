@@ -23,8 +23,8 @@ gh auth login
 git-shit start my-fix             # runs `git flow feature start my-fix`
 git-shit start my-fix production  # same, but branch off origin/production
 git-shit start part-2 --on=my-fix # stack part-2 on my-fix (its PR targets my-fix)
-git-shit checkout        # interactive list of local branches — pick one to check out
-git-shit checkout my-fix # switch straight to a branch (falls back to feature/my-fix)
+git-shit checkout        # interactive list of local branches — pick one to check out (+ pull latest)
+git-shit checkout my-fix # switch straight to a branch (falls back to feature/my-fix), then pull latest
 # ...do your work, commit as usual...
 git-shit status          # where am I? published? PR state? ahead/behind the base?
 git-shit sync            # catch the branch up to its base (rebase origin/staging in)
@@ -57,9 +57,11 @@ Runs `git flow feature start`. With `base`, the feature branches off `origin/<ba
 
 With `--on=<parent>` it stacks the new branch on another **feature branch** instead of a long-lived base — see [Stacked PRs](#stacked-prs).
 
-### `checkout [name] [--plain]`
+### `checkout [name] [--plain] [--no-pull]`
 
-Switch branches. With a `name`, it checks that branch out directly, like `git checkout` — and if the exact name doesn't exist but `feature/<name>` does, it switches to that (so `git-shit checkout my-fix` finds `feature/my-fix`).
+Switch branches **and land on the latest** — after checking out, it fast-forwards the branch to its upstream (`git pull --ff-only`), so you don't start work on a stale branch. It only fast-forwards: if the branch has diverged it says so and leaves your tree untouched (run `git-shit sync`/`pull`), and a branch with no upstream is left as-is. Pass `--no-pull` to just switch without pulling.
+
+With a `name`, it checks that branch out directly, like `git checkout` — and if the exact name doesn't exist but `feature/<name>` does, it switches to that (so `git-shit checkout my-fix` finds `feature/my-fix`).
 
 With **no argument**, it opens an interactive list of your local branches (most-recently-committed first, current one marked `*`), each with its last-commit age and subject:
 
@@ -72,10 +74,10 @@ git-shit checkout  ·  5 branch(es)
   hotfix/crash       1 day ago      Guard against null user
 * main               3 days ago     Initial commit
 
-↑/↓ move · PgUp/PgDn page · enter checkout · q quit
+↑/↓ move · PgUp/PgDn page · enter checkout · r refresh · q quit
 ```
 
-Arrow keys (or `j`/`k`) move, PgUp/PgDn page through long lists, and Enter checks out the highlighted branch. `--plain` (or piping) prints the static table instead. It's plain git underneath — no `gh`/GitHub needed.
+Arrow keys (or `j`/`k`) move, PgUp/PgDn page through long lists, `r` refreshes the list (fetches origin and re-reads your branches), and Enter checks out the highlighted branch (fast-forwarding it as above). `--plain` (or piping) prints the static table instead. It's plain git underneath — no `gh`/GitHub needed.
 
 ### Stacked PRs
 

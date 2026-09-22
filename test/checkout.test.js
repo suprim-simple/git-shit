@@ -83,5 +83,49 @@ r = gsh(repo, ['checkout', 'no-such-branch']);
 ok('checkout missing: exits non-zero', r.status !== 0);
 
 fs.rmSync(repo, { recursive: true, force: true });
+
+// --- integration: checkout fast-forwards to origin's latest ----------------
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gsh-cop-'));
+const bare = path.join(root, 'origin.git');
+const w1 = path.join(root, 'w1');
+const w2 = path.join(root, 'w2');
+g(root, ['init', '--quiet', '--bare', bare]);
+g(root, ['clone', '--quiet', bare, w1]);
+g(w1, ['config', 'user.email', 't@e.st']);
+g(w1, ['config', 'user.name', 'Test']);
+g(w1, ['commit', '--quiet', '--allow-empty', '-m', 'init']);
+g(w1, ['branch', '-M', 'main']);
+g(w1, ['push', '--quiet', '-u', 'origin', 'main']);
+g(w1, ['checkout', '--quiet', '-b', 'feature/z']);
+g(w1, ['commit', '--quiet', '--allow-empty', '-m', 'z1']);
+g(w1, ['push', '--quiet', '-u', 'origin', 'feature/z']); // upstream set
+g(w1, ['checkout', '--quiet', 'main']);
+
+// A second clone advances feature/z on origin.
+g(root, ['clone', '--quiet', bare, w2]);
+g(w2, ['config', 'user.email', 't@e.st']);
+g(w2, ['config', 'user.name', 'Test']);
+g(w2, ['checkout', '--quiet', 'feature/z']);
+fs.writeFileSync(path.join(w2, 'z.txt'), 'z\n');
+g(w2, ['add', '-A']);
+g(w2, ['commit', '--quiet', '-m', 'z2']);
+g(w2, ['push', '--quiet', 'origin', 'feature/z']);
+
+// checkout feature/z in w1 -> switches AND fast-forwards z2 in
+r = gsh(w1, ['checkout', 'feature/z']);
+ok('checkout(pull): exits 0', r.status === 0);
+eq('checkout(pull): now on feature/z', g(w1, ['rev-parse', '--abbrev-ref', 'HEAD']).trim(), 'feature/z');
+ok('checkout(pull): fast-forwarded z2 in', fs.existsSync(path.join(w1, 'z.txt')));
+
+// --- integration: --no-pull switches without pulling -----------------------
+g(w1, ['checkout', '--quiet', 'main']);
+g(w2, ['commit', '--quiet', '--allow-empty', '-m', 'z3']);
+g(w2, ['push', '--quiet', 'origin', 'feature/z']);
+const beforeCount = g(w1, ['rev-list', '--count', 'feature/z']).trim();
+r = gsh(w1, ['checkout', 'feature/z', '--no-pull']);
+ok('checkout --no-pull: exits 0', r.status === 0);
+eq('checkout --no-pull: did not pull z3', g(w1, ['rev-list', '--count', 'feature/z']).trim(), beforeCount);
+
+fs.rmSync(root, { recursive: true, force: true });
 console.log(`\n${pass} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
