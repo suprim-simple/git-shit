@@ -23,6 +23,8 @@ gh auth login
 git-shit start my-fix             # runs `git flow feature start my-fix`
 git-shit start my-fix production  # same, but branch off origin/production
 git-shit start part-2 --on=my-fix # stack part-2 on my-fix (its PR targets my-fix)
+git-shit checkout        # interactive list of local branches — pick one to check out
+git-shit checkout my-fix # switch straight to a branch (falls back to feature/my-fix)
 # ...do your work, commit as usual...
 git-shit status          # where am I? published? PR state? ahead/behind the base?
 git-shit sync            # catch the branch up to its base (rebase origin/staging in)
@@ -54,6 +56,26 @@ Runs `git flow feature start`. With `base`, the feature branches off `origin/<ba
 `git flow init` isn't required. In a repo where git-flow isn't initialised, `start` skips `git flow feature start` and creates the branch with a plain `git checkout -b` — off `origin/<base>` when you pass a base, off the `--on` parent when you stack, and otherwise off `origin/develop` (falling back to the default base, a local `develop`, then the current `HEAD`). Everything downstream (`ship`, `sync`, `merge`, `done`) already works without git-flow, so the whole workflow runs either way.
 
 With `--on=<parent>` it stacks the new branch on another **feature branch** instead of a long-lived base — see [Stacked PRs](#stacked-prs).
+
+### `checkout [name] [--plain]`
+
+Switch branches. With a `name`, it checks that branch out directly, like `git checkout` — and if the exact name doesn't exist but `feature/<name>` does, it switches to that (so `git-shit checkout my-fix` finds `feature/my-fix`).
+
+With **no argument**, it opens an interactive list of your local branches (most-recently-committed first, current one marked `*`), each with its last-commit age and subject:
+
+```
+git-shit checkout  ·  5 branch(es)
+
+  BRANCH             AGE            LAST COMMIT
+  develop            2 hours ago    Wire up the API
+  feature/login      5 hours ago    Add the login form
+  hotfix/crash       1 day ago      Guard against null user
+* main               3 days ago     Initial commit
+
+↑/↓ move · PgUp/PgDn page · enter checkout · q quit
+```
+
+Arrow keys (or `j`/`k`) move, PgUp/PgDn page through long lists, and Enter checks out the highlighted branch. `--plain` (or piping) prints the static table instead. It's plain git underneath — no `gh`/GitHub needed.
 
 ### Stacked PRs
 
