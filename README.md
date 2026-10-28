@@ -31,6 +31,7 @@ git-shit sync            # catch the branch up to its base (rebase origin/stagin
 git-shit sync --merge    # same, but merge the base in instead of rebasing
 git-shit ship            # pushes the branch and opens a PR into the base (default: staging)
 git-shit ship develop    # same, but the PR targets `develop` instead
+git-shit ship main production  # push once, open a PR into each
 git-shit ship --draft    # create the PR as a draft (GitHub + gh only)
 git-shit ship --open     # open the PR in the browser after the summary (no prompt)
 git-shit push            # push the current branch (offers to commit a dirty tree first)
@@ -38,6 +39,7 @@ git-shit push --force    # same, with --force-with-lease (safe after a rebase)
 git-shit pull            # pull the current branch from origin (--rebase to rebase)
 git-shit merge           # merge the open PR from the terminal, then clean up
 git-shit merge --squash  # same, squash-merged (also: --rebase)
+git-shit merge production  # branch has PRs into several bases? pick one
 git-shit merge --when-green  # wait for checks to pass, then merge + notify
 git-shit done            # cleanup only: checkout the base, pull, delete branch, prune
 git-shit list            # interactive board of every feature/* branch (--plain for a static table)
@@ -99,13 +101,17 @@ git-shit ship                      # PR: feature/ui -> feature/api
 
 `status` and `list` both show the stack — `status` labels the base as a *stacked parent*, and `list` indents each child under its parent.
 
-### `ship [dest] [--draft] [--web] [--open] [--reviewer=…] [--label=…] [--assignee=…]`
+### `ship [dest...] [--draft] [--web] [--open] [--reviewer=…] [--label=…] [--assignee=…]`
 
 1. Verifies you have no uncommitted changes and that the destination branch (default: the base recorded by `start`, else `staging`) exists on `origin`. A `feature/*` branch is the normal case, but any branch can ship — off a `feature/*` branch it just prints a note and carries on (it only refuses to ship a branch into itself). If the tree is dirty and you're in a terminal, `ship` shows the changes and offers to stage them all (`git add -A`) and commit them for you — it prints the `git status`, asks for confirmation, then prompts for a commit message and commits before continuing. Decline (or run non-interactively, e.g. in a script) and it falls back to the old behaviour: it stops and asks you to commit or stash first, without touching your tree.
 2. Publishes the branch — `git flow feature publish` for a `feature/*` branch in a git-flow-initialised repo, otherwise a plain `git push -u origin <branch>` — or just pushes if it's already on `origin`. So `ship` works even in a repo where you never ran `git flow init` (a `feature/*` branch there is just published with a plain push).
 3. Creates the PR:
    - **GitHub remote + `gh` logged in** — creates the PR from the terminal with `gh pr create`. The title and body come from the branch's commits: a single-commit branch uses that commit's subject and full message body, while a multi-commit branch uses the first commit's subject as the title and a bullet list of every commit subject as the body. If the repo has a [pull-request template](#pr-title-and-body), it's used as the body instead. If the branch already has an open PR, it just tells you (the push already updated it). `--draft` opens it as a draft; `--web` skips `gh` and forces the browser flow.
    - **Bitbucket, or no `gh`** — opens the "new pull request" page in Chrome, pre-filled with source, destination, and title. On macOS it polls the active Chrome tab and auto-clicks **Create pull request** once it renders. Workspace/repo are auto-detected from `origin` (SSH or HTTPS).
+
+   **Several destinations** — `git-shit ship main production` checks every destination exists, pushes the branch once, then creates (or finds) a PR into each, with a summary per PR and one prompt to open them all. An existing PR only counts if it targets that destination, so shipping a branch to `main` and later to `production` opens a second PR rather than mistaking the first for it.
+
+   Progress is shown CI-style: each step (fetch, push, check/create PR, summary) shows a spinner with a live timer, then ✓ / ! / ✗ and how long it took. Git and `gh` output is only printed when a step fails.
 
 4. Prints a **summary** of what you just shipped:
 
@@ -155,9 +161,9 @@ Brings the latest base into the current branch so it doesn't drift behind while 
 
 If the branch is already published, `sync` reminds you to update the open PR: a rebase rewrote history, so it needs `git push --force-with-lease origin <branch>`; a merge only adds a commit, so a plain `git-shit ship` is enough.
 
-### `merge [--merge|--squash|--rebase] [--when-green]` (GitHub + gh)
+### `merge [dest] [--merge|--squash|--rebase] [--when-green]` (GitHub + gh)
 
-Merges the current branch's open PR with `gh pr merge` (default: a merge commit), then runs the `done` cleanup against the PR's actual base branch. Works on a `feature/*` branch or any other branch you shipped (off a `feature/*` branch it prints a note and the cleanup leaves the local branch in place). Refuses if you have unpushed commits, if there's no open PR, or if the PR is still a draft. On Bitbucket, merge in the browser and run `git-shit done` instead.
+Merges the current branch's open PR with `gh pr merge` (default: a merge commit), then runs the `done` cleanup against the PR's actual base branch. If the branch has open PRs into several bases (see `ship main production`), name the one to merge — `git-shit merge production` — otherwise it lists them and stops. The `done` cleanup waits for the last one: while other PRs from the branch are still open, `merge` keeps the branch and lists them. (If your repo auto-deletes head branches on merge, GitHub closes those other PRs when the first merges.) Works on a `feature/*` branch or any other branch you shipped (off a `feature/*` branch it prints a note and the cleanup leaves the local branch in place). Refuses if you have unpushed commits, if there's no open PR, or if the PR is still a draft. On Bitbucket, merge in the browser and run `git-shit done` instead.
 
 With **`--when-green`** it doesn't merge right away — it polls the PR's checks every 20s and merges only once they're all passing, then cleans up. A failing check stops it (no merge); a PR with no checks merges immediately. Either way you get a desktop notification (plus a terminal bell) when it merges or a check fails, so you can kick it off and walk away. `gh pr merge --auto` queues a merge on GitHub's side but doesn't do the local `done` cleanup or notify you — this closes that loop. (Stop the wait any time with Ctrl-C; it gives up after an hour.)
 
@@ -167,11 +173,11 @@ Run after the PR is merged in the browser (`merge` does this for you). Checks ou
 
 ### `status`
 
-Shows the current branch, its recorded base (if not `staging`), whether it's clean, whether it's published to `origin`, unpushed commits, and ahead/behind counts vs the base. With `gh` on a GitHub remote it also shows the live PR state — number, open/draft/merged, review decision, mergeability, and URL.
+Shows the current branch, its recorded base (if not `staging`), whether it's clean, whether it's published to `origin`, unpushed commits, and ahead/behind counts vs the base. With `gh` on a GitHub remote it also shows the live PR state — number, target base, open/draft/merged, review decision, mergeability, and URL — for every open PR from the branch (or its latest PR when none is open).
 
 ### `list [--plain]`
 
-A dashboard of **all** your in-flight work — every local `feature/*` branch at once, most-recently-worked first, instead of one branch at a time. For each it shows the base, publish state, and (with `gh` on a GitHub remote) the live PR state — number, open/draft/merged, a check-run summary (`checks: ok`, `checks: 2/3`, or `checks: 1 failing`), and the review decision. The current branch is marked with `*`. When a branch has an open/merged PR, the base column reflects the PR's actual target; otherwise it's the base `ship` would use. [Stacked](#stacked-prs) children are indented under their parent.
+A dashboard of **all** your in-flight work — every local `feature/*` branch at once, most-recently-worked first, instead of one branch at a time. For each it shows the base, publish state, and (with `gh` on a GitHub remote) the live PR state — number, open/draft/merged, a check-run summary (`checks: ok`, `checks: 2/3`, or `checks: 1 failing`), and the review decision. The current branch is marked with `*`. When a branch has an open/merged PR, the base column reflects the PR's actual target; otherwise it's the base `ship` would use. A branch with open PRs into several bases shows the one into its own base, and notes the rest (`also #2 -> production`). [Stacked](#stacked-prs) children are indented under their parent.
 
 ```
   BRANCH                 BASE            STATE       PR
