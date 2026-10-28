@@ -77,7 +77,7 @@ const COMMANDS = [
 const FLAGS = {
   start: ['--on='],
   checkout: ['--plain', '--no-pull'],
-  ship: ['--draft', '--web', '--reviewer=', '--label=', '--assignee='],
+  ship: ['--draft', '--web', '--open', '--reviewer=', '--label=', '--assignee='],
   push: ['--force'],
   pull: ['--rebase'],
   sync: ['--merge', '--rebase'],
@@ -454,13 +454,15 @@ Usage:
                          With no name, opens an interactive list of local
                          branches — pick one to check out, r to refresh the list
                          (--plain prints a static table).
-  ${PROG} ship [dest] [--draft] [--web]
+  ${PROG} ship [dest] [--draft] [--web] [--open]
        [--reviewer=a,b] [--label=x] [--assignee=@me]
                          Push current feature and open a PR against dest
                          (default: the branch's recorded base, else ${base}).
                          On GitHub with the gh CLI the
                          PR is created from the terminal (--draft for a draft
-                         PR, --web to force the browser flow). Bitbucket or no
+                         PR, --web to force the browser flow), then a summary
+                         shows commits, files changed, checks, and conflicts,
+                         and offers to open the PR (--open: no prompt). Bitbucket or no
                          gh: opens the PR page in Chrome and auto-clicks Create.
                          Reviewers/labels/assignees also come from git config
                          (gitshit.reviewers/labels/assignees).
@@ -909,6 +911,123 @@ function prPeople(opts) {
   };
 }
 
+// --- post-ship summary ------------------------------------------------------
+// After `ship`, show what the PR carries: commits, files changed (+/-), checks,
+// and whether it conflicts with the base. On GitHub the numbers come from gh
+// (the PR as GitHub sees it); in the browser flow they're computed locally
+// against origin/<base>. Both normalise to the same "facts" shape so one pure
+// formatter renders them.
+
+// Facts from `gh pr view --json number,url,commits,changedFiles,additions,
+// deletions,mergeable,statusCheckRollup`. conflicts is true/false, or null
+// while GitHub is still computing mergeability. Exported for tests.
+function prSummaryFacts(pr) {
+  return {
+    commits: Array.isArray(pr.commits) ? pr.commits.length : null,
+    files: typeof pr.changedFiles === 'number' ? pr.changedFiles : null,
+    additions: typeof pr.additions === 'number' ? pr.additions : null,
+    deletions: typeof pr.deletions === 'number' ? pr.deletions : null,
+    conflicts: pr.mergeable === 'CONFLICTING' ? true : pr.mergeable === 'MERGEABLE' ? false : null,
+    checks: checksSummary(pr.statusCheckRollup) || 'checks: none reported yet',
+  };
+}
+
+// Parse `git diff --shortstat` ("3 files changed, 10 insertions(+), 2
+// deletions(-)") into {files, additions, deletions}. Exported for tests.
+function parseShortstat(out) {
+  const num = (re) => {
+    const m = re.exec(out || '');
+    return m ? Number(m[1]) : 0;
+  };
+  return {
+    files: num(/(\d+) files? changed/),
+    additions: num(/(\d+) insertions?\(\+\)/),
+    deletions: num(/(\d+) deletions?\(-\)/),
+  };
+}
+
+// The same facts computed locally, for the browser flow (no gh). Conflicts use
+// `git merge-tree --write-tree` (git >= 2.38): exit 0 clean, 1 conflicted;
+// anything else (older git) leaves it unknown. Checks aren't knowable locally.
+function localSummaryFacts(base, branch) {
+  const facts = { commits: null, files: null, additions: null, deletions: null, conflicts: null, checks: null };
+  try {
+    facts.commits = Number(git(['rev-list', '--count', `origin/${base}..${branch}`]));
+    Object.assign(facts, parseShortstat(git(['diff', '--shortstat', `origin/${base}...${branch}`])));
+  } catch {}
+  const mt = spawnSync('git', ['merge-tree', '--write-tree', '--name-only', '--no-messages', `origin/${base}`, branch], {
+    stdio: 'ignore',
+  });
+  if (mt.status === 0) facts.conflicts = false;
+  else if (mt.status === 1) facts.conflicts = true;
+  return facts;
+}
+
+// Render the facts as indented summary lines. Unknown values are left out
+// rather than shown as 0. Exported for tests.
+function shipSummaryLines(facts, base) {
+  const lines = [];
+  if (facts.commits !== null) lines.push(`commits:   ${facts.commits}`);
+  if (facts.files !== null) {
+    const delta = facts.additions !== null ? `  (+${facts.additions} / -${facts.deletions || 0})` : '';
+    lines.push(`files:     ${facts.files} changed${delta}`);
+  }
+  if (facts.checks) lines.push(`checks:    ${facts.checks.replace(/^checks: /, '')}`);
+  if (facts.conflicts === true) {
+    lines.push(`conflicts: YES — conflicts with ${base}; fix with: ${PROG} sync`);
+  } else if (facts.conflicts === false) {
+    lines.push(`conflicts: none — merges cleanly into ${base}`);
+  } else {
+    lines.push('conflicts: unknown (not computed yet)');
+  }
+  return lines.map((l) => `    ${l}`);
+}
+
+const PR_SUMMARY_FIELDS = 'number,url,state,isDraft,commits,changedFiles,additions,deletions,mergeable,statusCheckRollup';
+
+// Fetch the PR's summary from gh. GitHub computes mergeability lazily after a
+// push, so `mergeable` is often UNKNOWN at first — retry briefly for a real
+// answer, then settle for unknown rather than make ship hang.
+async function fetchPrSummary(branch) {
+  let pr = null;
+  for (let i = 0; i < 4; i++) {
+    pr = await ghJsonAsync(['pr', 'view', branch, '--json', PR_SUMMARY_FIELDS]);
+    if (!pr || pr.mergeable !== 'UNKNOWN') break;
+    await sleep(1500);
+  }
+  return pr;
+}
+
+// One keypress, board-style: o / Enter opens the PR, any other key carries on.
+async function promptOpenKey() {
+  const { dim, bold, reset } = ANSI;
+  const stdin = process.stdin;
+  process.stdout.write(`${dim}${bold}o${reset}${dim} open PR in browser · any other key to finish${reset}`);
+  stdin.resume();
+  stdin.setEncoding('utf8');
+  try { stdin.setRawMode(true); } catch {}
+  const key = await readKey(stdin);
+  try { stdin.setRawMode(false); } catch {}
+  stdin.pause();
+  process.stdout.write('\r\x1b[K');
+  return key === 'o' || key === 'O' || key === '\r';
+}
+
+// Print the PR summary and offer to open it in the browser (a new tab). --open
+// opens without asking; non-interactive runs just print the URL.
+async function showPrSummary(branch, baseBranch, opts = {}) {
+  const pr = await withSpinner('Gathering PR summary', () => fetchPrSummary(branch));
+  if (!pr) return;
+  console.log('');
+  console.log(`==> PR #${pr.number}${pr.isDraft ? ' (draft)' : ''}: ${branch} -> ${baseBranch}`);
+  for (const line of shipSummaryLines(prSummaryFacts(pr), baseBranch)) console.log(line);
+  console.log(`    ${pr.url}`);
+  console.log('');
+  let open = opts.open;
+  if (!open && interactive()) open = await promptOpenKey();
+  if (open) openUrl(pr.url);
+}
+
 // Create the PR with `gh pr create` (or recognise the one already open).
 async function shipViaGh(branch, baseBranch, opts = {}) {
   const existing = await withSpinner('Checking for an existing PR', () =>
@@ -942,7 +1061,8 @@ async function shipViaGh(branch, baseBranch, opts = {}) {
     }));
   }
 
-  console.log('');
+  await showPrSummary(branch, baseBranch, opts);
+
   console.log(`Check reviews/checks with: ${PROG} status`);
   console.log(`When it's ready, merge and clean up with: ${PROG} merge`);
 }
@@ -1146,6 +1266,9 @@ async function cmdShip(dest, opts = {}) {
     console.log('    (tip: install the GitHub CLI and run `gh auth login` to create');
     console.log('     PRs straight from the terminal: https://cli.github.com)');
   }
+
+  console.log(`==> Summary: ${branch} -> ${baseBranch}`);
+  for (const line of shipSummaryLines(localSummaryFacts(baseBranch, branch), baseBranch)) console.log(line);
 
   const prUrl = buildPrUrl(repo, branch, baseBranch);
   console.log(`==> Opening PR page: ${branch} -> ${baseBranch}`);
@@ -2580,6 +2703,7 @@ async function main() {
       for (const f of flags) {
         if (f === '--draft') opts.draft = true;
         else if (f === '--web') opts.web = true;
+        else if (f === '--open') opts.open = true;
         else if (f.startsWith('--reviewer=')) opts.reviewers.push(...splitList(f.slice('--reviewer='.length)));
         else if (f.startsWith('--label=')) opts.labels.push(...splitList(f.slice('--label='.length)));
         else if (f.startsWith('--assignee=')) opts.assignees.push(...splitList(f.slice('--assignee='.length)));
@@ -2695,6 +2819,10 @@ module.exports = {
   branchLabel,
   renderList,
   withIssueClose,
+  prSummaryFacts,
+  parseShortstat,
+  localSummaryFacts,
+  shipSummaryLines,
   slugify,
   issueBranchName,
   relAge,
