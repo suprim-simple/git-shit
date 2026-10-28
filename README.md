@@ -32,6 +32,7 @@ git-shit sync --merge    # same, but merge the base in instead of rebasing
 git-shit ship            # pushes the branch and opens a PR into the base (default: staging)
 git-shit ship develop    # same, but the PR targets `develop` instead
 git-shit ship --draft    # create the PR as a draft (GitHub + gh only)
+git-shit ship --open     # open the PR in the browser after the summary (no prompt)
 git-shit push            # push the current branch (offers to commit a dirty tree first)
 git-shit push --force    # same, with --force-with-lease (safe after a rebase)
 git-shit pull            # pull the current branch from origin (--rebase to rebase)
@@ -98,13 +99,28 @@ git-shit ship                      # PR: feature/ui -> feature/api
 
 `status` and `list` both show the stack — `status` labels the base as a *stacked parent*, and `list` indents each child under its parent.
 
-### `ship [dest] [--draft] [--web] [--reviewer=…] [--label=…] [--assignee=…]`
+### `ship [dest] [--draft] [--web] [--open] [--reviewer=…] [--label=…] [--assignee=…]`
 
 1. Verifies you have no uncommitted changes and that the destination branch (default: the base recorded by `start`, else `staging`) exists on `origin`. A `feature/*` branch is the normal case, but any branch can ship — off a `feature/*` branch it just prints a note and carries on (it only refuses to ship a branch into itself). If the tree is dirty and you're in a terminal, `ship` shows the changes and offers to stage them all (`git add -A`) and commit them for you — it prints the `git status`, asks for confirmation, then prompts for a commit message and commits before continuing. Decline (or run non-interactively, e.g. in a script) and it falls back to the old behaviour: it stops and asks you to commit or stash first, without touching your tree.
 2. Publishes the branch — `git flow feature publish` for a `feature/*` branch in a git-flow-initialised repo, otherwise a plain `git push -u origin <branch>` — or just pushes if it's already on `origin`. So `ship` works even in a repo where you never ran `git flow init` (a `feature/*` branch there is just published with a plain push).
 3. Creates the PR:
    - **GitHub remote + `gh` logged in** — creates the PR from the terminal with `gh pr create`. The title and body come from the branch's commits: a single-commit branch uses that commit's subject and full message body, while a multi-commit branch uses the first commit's subject as the title and a bullet list of every commit subject as the body. If the repo has a [pull-request template](#pr-title-and-body), it's used as the body instead. If the branch already has an open PR, it just tells you (the push already updated it). `--draft` opens it as a draft; `--web` skips `gh` and forces the browser flow.
    - **Bitbucket, or no `gh`** — opens the "new pull request" page in Chrome, pre-filled with source, destination, and title. On macOS it polls the active Chrome tab and auto-clicks **Create pull request** once it renders. Workspace/repo are auto-detected from `origin` (SSH or HTTPS).
+
+4. Prints a **summary** of what you just shipped:
+
+   ```
+   ==> PR #42: feature/new-nav -> staging
+       commits:   3
+       files:     4 changed  (+120 / -7)
+       checks:    1/2
+       conflicts: none — merges cleanly into staging
+       https://github.com/acme/widgets/pull/42
+
+   o open PR in browser · any other key to finish
+   ```
+
+   With `gh`, the numbers are GitHub's view of the PR. Checks have usually only just started at this point, and if GitHub is still working out mergeability after a few seconds, `conflicts` shows *unknown*. On conflicts, run `git-shit sync`. Press `o` (or Enter) to open the PR in a new browser tab, any other key to finish, or pass `--open` to open it without the prompt. In the browser flow, the same summary (minus checks) is computed locally against `origin/<base>` before the PR page opens. Conflict detection there needs git ≥ 2.38 (`git merge-tree --write-tree`).
 
 **Reviewers, labels, and assignees** (GitHub + `gh`, on PR creation): pass `--reviewer=alice,bob`, `--label=feature,needs-qa`, or `--assignee=@me` (comma-separated, use the `=` form). Each is unioned with a per-repo default from git config — set `gitshit.reviewers`, `gitshit.labels`, and `gitshit.assignees` once and every PR gets them for free (see [Configuration](#configuration)). They only apply when a new PR is created, and are ignored (with a note) in the Bitbucket/browser flow.
 
