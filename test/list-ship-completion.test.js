@@ -9,6 +9,7 @@ const {
   splitList,
   uniq,
   prCreateArgs,
+  prPeopleCalls,
   tallyChecks,
   checksSummary,
   reviewSummary,
@@ -77,20 +78,24 @@ eq('splitList: empty -> []', splitList(''), []);
 eq('splitList: null -> []', splitList(null), []);
 eq('uniq: preserves first-seen order', uniq(['a', 'b', 'a', 'c', 'b']), ['a', 'b', 'c']);
 
-// --- prCreateArgs -----------------------------------------------------------
-eq('prCreateArgs: minimal',
-  prCreateArgs({ base: 'main', head: 'feature/x', title: 'T', body: 'B' }),
-  ['pr', 'create', '--base', 'main', '--head', 'feature/x', '--title', 'T', '--body', 'B']);
-eq('prCreateArgs: title falls back to head',
-  prCreateArgs({ base: 'main', head: 'feature/x', title: '', body: '' }).slice(6, 8),
-  ['--title', 'feature/x']);
-eq('prCreateArgs: draft + people as repeated flags',
-  prCreateArgs({
-    base: 'main', head: 'feature/x', title: 'T', body: 'B', draft: true,
-    reviewers: ['alice', 'bob'], labels: ['feat'], assignees: ['@me'],
-  }),
-  ['pr', 'create', '--base', 'main', '--head', 'feature/x', '--title', 'T', '--body', 'B',
-    '--draft', '--reviewer', 'alice', '--reviewer', 'bob', '--label', 'feat', '--assignee', '@me']);
+// --- prCreateArgs / prPeopleCalls -------------------------------------------
+eq('prCreateArgs: one REST call',
+  prCreateArgs({ nwo: 'acme/w', base: 'main', head: 'feature/x', title: 'T', body: 'B' }),
+  ['api', '-X', 'POST', 'repos/acme/w/pulls', '-f', 'base=main', '-f', 'head=feature/x',
+    '-f', 'title=T', '-f', 'body=B', '-F', 'draft=false']);
+eq('prCreateArgs: title falls back to head, draft',
+  prCreateArgs({ nwo: 'acme/w', base: 'main', head: 'feature/x', title: '', body: '', draft: true }).filter((a) => /^(title|draft)=/.test(a)),
+  ['title=feature/x', 'draft=true']);
+eq('prPeopleCalls: none -> no calls', prPeopleCalls({ nwo: 'acme/w', number: 7 }), []);
+eq('prPeopleCalls: users, teams, labels, @me',
+  prPeopleCalls({
+    nwo: 'acme/w', number: 7, reviewers: ['alice', 'acme/core'], labels: ['feat'], assignees: ['@me', 'bob'], me: 'carol',
+  }).map((c) => c.args.slice(3)),
+  [
+    ['repos/acme/w/pulls/7/requested_reviewers', '-f', 'reviewers[]=alice', '-f', 'team_reviewers[]=core'],
+    ['repos/acme/w/issues/7/labels', '-f', 'labels[]=feat'],
+    ['repos/acme/w/issues/7/assignees', '-f', 'assignees[]=carol', '-f', 'assignees[]=bob'],
+  ]);
 
 // --- checksSummary ----------------------------------------------------------
 eq('checks: empty/none -> ""', checksSummary([]), '');

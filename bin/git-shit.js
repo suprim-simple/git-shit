@@ -346,7 +346,8 @@ function ghUsable(repo) {
     ghOk =
       // `gh auth token` reads the stored credential locally; `gh auth status`
       // would validate it against the API — a network round-trip on every run.
-      commandExists('gh') &&
+      // A missing gh just fails to spawn (status null), so no separate
+      // `command -v gh` shell is needed.
       spawnSync('gh', ['auth', 'token', '--hostname', 'github.com'], { stdio: 'ignore' })
         .status === 0;
   }
@@ -459,59 +460,103 @@ class StepFailure extends Error {
   }
 }
 
-// Run `work(s)` as one step. `s.note(text)` appends a dim detail to the final
-// line, `s.warn(text)` does too but marks the step ! instead of ✓, and
-// `s.detail(line)` adds an indented line printed under it. Resolves with
-// work's return value; a StepFailure prints ✗ plus its output and exits.
-async function step(label, work) {
+// Run several steps at once — like parallel CI jobs. Each def is
+// { label, work(s) }: `s.note(text)` appends a dim detail to its final line,
+// `s.warn(text)` does too but marks it ! instead of ✓, and `s.detail(line)`
+// adds an indented line under it. On a TTY every running step gets its own
+// spinner line with a live timer; each settles to ✓ / ! / ✗ with how long it
+// took. Resolves with the works' return values, in order. If any step throws,
+// the others still finish, then the failures' output is printed and the
+// process exits (a StepFailure's status, else 1).
+async function steps(defs) {
   const t0 = Date.now();
-  const live = !!(process.stdout.isTTY && process.stderr.isTTY);
-  const state = { note: '', warn: false, details: [] };
-  const s = {
-    note(text) { state.note = text; },
-    warn(text) { state.note = text; state.warn = true; },
-    detail(line) { state.details.push(line); },
+  const live = !!process.stdout.isTTY;
+  const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+  let frame = 0;
+  const rows = defs.map((d) => ({ label: d.label, note: '', warn: false, details: [], end: null, mark: '', error: null }));
+
+  const line = (r) => {
+    if (!r.end) return `${paint(36, frames[frame])} ${r.label}  ${paint(2, fmtSecs(Date.now() - t0))}`;
+    const note = r.note ? `  ${paint(2, r.note)}` : '';
+    return `${r.mark} ${r.label}${note}  ${paint(2, fmtSecs(r.end - t0))}`;
   };
 
+  // Live: redraw the whole block in place (cursor up, rewrite each line).
   let timer = null;
+  let drawn = false;
+  const draw = () => {
+    frame = (frame + 1) % frames.length;
+    const up = drawn ? `\x1b[${rows.length}A` : '';
+    process.stdout.write(up + rows.map((r) => `\r\x1b[K${line(r)}\n`).join(''));
+    drawn = true;
+  };
+  const showCursor = () => process.stdout.write('\x1b[?25h');
   if (live) {
-    const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    let i = 0;
-    const draw = () =>
-      process.stderr.write(
-        `\r\x1b[K${paint(36, frames[i = (i + 1) % frames.length])} ${label}  ${paint(2, fmtSecs(Date.now() - t0))}`
-      );
-    process.stderr.write('\x1b[?25l');
+    process.stdout.write('\x1b[?25l');
+    process.once('exit', showCursor);
     draw();
     timer = setInterval(draw, 80);
   } else {
-    console.log(`▸ ${label}`);
+    for (const r of rows) console.log(`▸ ${r.label}`);
   }
 
-  const finish = (mark) => {
-    if (timer) {
-      clearInterval(timer);
-      process.stderr.write('\r\x1b[K\x1b[?25h');
-    }
-    const note = state.note ? `  ${paint(2, state.note)}` : '';
-    console.log(`${mark} ${label}${note}  ${paint(2, fmtSecs(Date.now() - t0))}`);
-    for (const line of state.details) console.log(`    ${line}`);
-  };
+  const values = await Promise.all(
+    defs.map(async (d, i) => {
+      const r = rows[i];
+      const s = {
+        note(text) { r.note = text; },
+        warn(text) { r.note = text; r.warn = true; },
+        detail(l) { r.details.push(l); },
+      };
+      try {
+        const v = await d.work(s);
+        r.mark = r.warn ? paint(33, '!') : paint(32, '✓');
+        return v;
+      } catch (e) {
+        r.error = e;
+        r.mark = paint(31, '✗');
+        return undefined;
+      } finally {
+        r.end = Date.now();
+        if (!live) console.log(line(r));
+      }
+    })
+  );
 
-  try {
-    const value = await work(s);
-    finish(state.warn ? paint(33, '!') : paint(32, '✓'));
-    return value;
-  } catch (e) {
-    finish(paint(31, '✗'));
-    const output = e instanceof StepFailure ? e.output : String((e && e.stack) || e);
-    if (output && output.trim()) {
-      console.error('');
-      for (const line of output.trimEnd().split('\n')) console.error(`    ${line}`);
-      console.error('');
+  if (live) {
+    clearInterval(timer);
+    // Final render: replace the live block with the settled lines + details.
+    process.stdout.write(`\x1b[${rows.length}A\r\x1b[J`);
+    for (const r of rows) {
+      console.log(line(r));
+      for (const l of r.details) console.log(`    ${l}`);
     }
-    process.exit(e instanceof StepFailure ? e.status : 1);
+    showCursor();
+    process.removeListener('exit', showCursor);
+  } else {
+    for (const r of rows) for (const l of r.details) console.log(`    ${l}`);
   }
+
+  const failures = rows.filter((r) => r.error);
+  if (failures.length) {
+    for (const r of failures) {
+      const e = r.error;
+      const output = e instanceof StepFailure ? e.output : String((e && e.stack) || e);
+      if (output && output.trim()) {
+        console.error('');
+        for (const l of output.trimEnd().split('\n')) console.error(`    ${l}`);
+      }
+    }
+    console.error('');
+    const first = failures[0].error;
+    process.exit(first instanceof StepFailure ? first.status : 1);
+  }
+  return values;
+}
+
+// Run `work(s)` as a single step (see steps).
+async function step(label, work) {
+  return (await steps([{ label, work }]))[0];
 }
 
 // Run a command for a step, capturing its output; throws StepFailure (with that
@@ -980,21 +1025,51 @@ function withIssueClose(body, issueNum) {
   return body ? `${body}\n\n${closer}` : closer;
 }
 
-// Build the `gh pr create` argument list. Reviewers/labels/assignees are each
-// passed as repeated flags (gh accepts one value per flag).
-function prCreateArgs({ base, head, title, body, draft, reviewers = [], labels = [], assignees = [] }) {
-  const args = [
-    'pr', 'create',
-    '--base', base,
-    '--head', head,
-    '--title', title || head,
-    '--body', body || '',
+// `gh api` calls that create a PR and then add its people/labels. The PR is
+// created with one REST call rather than `gh pr create`, which spends over a
+// second on its own lookups (repo, existing PR, …) before it creates anything
+// — ship has already checked for an existing PR itself. -f sends values raw
+// (no @file expansion), so any title/body is safe. Exported for tests.
+function prCreateArgs({ nwo, base, head, title, body, draft }) {
+  return [
+    'api', '-X', 'POST', `repos/${nwo}/pulls`,
+    '-f', `base=${base}`,
+    '-f', `head=${head}`,
+    '-f', `title=${title || head}`,
+    '-f', `body=${body || ''}`,
+    '-F', `draft=${draft ? 'true' : 'false'}`,
   ];
-  if (draft) args.push('--draft');
-  for (const r of reviewers) args.push('--reviewer', r);
-  for (const l of labels) args.push('--label', l);
-  for (const a of assignees) args.push('--assignee', a);
-  return args;
+}
+
+// The follow-up calls for a new PR's reviewers, labels and assignees (each
+// list may be empty → no call). "org/team" reviewers are team requests.
+// `me` is the viewer's login, standing in for "@me". Exported for tests.
+function prPeopleCalls({ nwo, number, reviewers = [], labels = [], assignees = [], me = '' }) {
+  const calls = [];
+  const field = (key, vals) => vals.flatMap((v) => ['-f', `${key}[]=${v}`]);
+  const users = reviewers.filter((r) => !r.includes('/'));
+  const teams = reviewers.filter((r) => r.includes('/')).map((r) => r.split('/').pop());
+  if (users.length || teams.length) {
+    calls.push({
+      what: `reviewers: ${reviewers.join(', ')}`,
+      args: ['api', '-X', 'POST', `repos/${nwo}/pulls/${number}/requested_reviewers`,
+        ...field('reviewers', users), ...field('team_reviewers', teams)],
+    });
+  }
+  if (labels.length) {
+    calls.push({
+      what: `labels: ${labels.join(', ')}`,
+      args: ['api', '-X', 'POST', `repos/${nwo}/issues/${number}/labels`, ...field('labels', labels)],
+    });
+  }
+  if (assignees.length) {
+    const logins = assignees.map((a) => (a === '@me' ? me : a)).filter(Boolean);
+    calls.push({
+      what: `assignees: ${assignees.join(', ')}`,
+      args: ['api', '-X', 'POST', `repos/${nwo}/issues/${number}/assignees`, ...field('assignees', logins)],
+    });
+  }
+  return calls;
 }
 
 // Reviewers/labels/assignees for a new PR: git-config defaults unioned with any
@@ -1008,25 +1083,11 @@ function prPeople(opts) {
 }
 
 // --- post-ship summary ------------------------------------------------------
-// After `ship`, show what the PR carries: commits, files changed (+/-), checks,
-// and whether it conflicts with the base. On GitHub the numbers come from gh
-// (the PR as GitHub sees it); in the browser flow they're computed locally
-// against origin/<base>. Both normalise to the same "facts" shape so one pure
-// formatter renders them.
-
-// Facts from `gh pr view --json number,url,commits,changedFiles,additions,
-// deletions,mergeable,statusCheckRollup`. conflicts is true/false, or null
-// while GitHub is still computing mergeability. Exported for tests.
-function prSummaryFacts(pr) {
-  return {
-    commits: Array.isArray(pr.commits) ? pr.commits.length : null,
-    files: typeof pr.changedFiles === 'number' ? pr.changedFiles : null,
-    additions: typeof pr.additions === 'number' ? pr.additions : null,
-    deletions: typeof pr.deletions === 'number' ? pr.deletions : null,
-    conflicts: pr.mergeable === 'CONFLICTING' ? true : pr.mergeable === 'MERGEABLE' ? false : null,
-    checks: checksSummary(pr.statusCheckRollup) || 'checks: none reported yet',
-  };
-}
+// After `ship`, show what the PR carries: commits, files changed (+/-), and
+// whether it conflicts with the base. It's computed locally against
+// origin/<base> — ship has just pushed the branch and fetched any base that
+// moved, so this matches GitHub's view of the PR without another round-trip
+// (and GitHub's own mergeability is usually still "unknown" this soon).
 
 // Parse `git diff --shortstat` ("3 files changed, 10 insertions(+), 2
 // deletions(-)") into {files, additions, deletions}. Exported for tests.
@@ -1042,7 +1103,7 @@ function parseShortstat(out) {
   };
 }
 
-// The same facts computed locally, for the browser flow (no gh). Conflicts use
+// The summary facts, computed locally. Conflicts use
 // `git merge-tree --write-tree` (git >= 2.38): exit 0 clean, 1 conflicted;
 // anything else (older git) leaves it unknown. Checks aren't knowable locally.
 function localSummaryFacts(base, branch) {
@@ -1079,19 +1140,6 @@ function shipSummaryLines(facts, base) {
   return lines.map((l) => `    ${l}`);
 }
 
-const PR_SUMMARY_FIELDS = 'number,url,state,isDraft,commits,changedFiles,additions,deletions,mergeable,statusCheckRollup';
-
-// Fetch the PR's summary from gh. GitHub computes mergeability lazily after a
-// push, so `mergeable` is usually UNKNOWN right after shipping. Rather than poll
-// (seconds of sleeping), the caller fills conflicts in locally with merge-tree —
-// ship has just fetched, so origin/<base> is current.
-// `pr` is the PR's number or URL, not the branch: a branch can have open PRs
-// into several bases (e.g. main and production), and `gh pr view <branch>`
-// would pick one of them regardless of which this ship targeted.
-function fetchPrSummary(pr) {
-  return ghJsonAsync(['pr', 'view', String(pr), '--json', PR_SUMMARY_FIELDS]);
-}
-
 // One keypress, board-style: o / Enter opens the PR, any other key carries on.
 async function promptOpenKey(what = 'open PR') {
   const { dim, bold, reset } = ANSI;
@@ -1107,24 +1155,13 @@ async function promptOpenKey(what = 'open PR') {
   return key === 'o' || key === 'O' || key === '\r';
 }
 
-// Print the PR summary; resolves with the PR's URL (null if gh couldn't read
-// it). Opening it is left to offerOpenPrs, so a multi-destination ship asks
-// once for all its PRs.
-async function showPrSummary(prRef, branch, baseBranch) {
-  const pr = await step('Gather PR summary', async (s) => {
-    const found = prRef ? await fetchPrSummary(prRef) : null;
-    if (!found) s.warn("couldn't read the PR from gh");
-    return found;
-  });
-  if (!pr) return;
-  const facts = prSummaryFacts(pr);
-  if (facts.conflicts === null) facts.conflicts = localSummaryFacts(baseBranch, branch).conflicts;
+// Print a shipped PR's summary ({ number, url, isDraft }). Opening it is left
+// to offerOpenPrs, so a multi-destination ship asks once for all its PRs.
+function showPrSummary(pr, branch, baseBranch) {
   console.log('');
   console.log(`==> PR #${pr.number}${pr.isDraft ? ' (draft)' : ''}: ${branch} -> ${baseBranch}`);
-  for (const line of shipSummaryLines(facts, baseBranch)) console.log(line);
+  for (const line of shipSummaryLines(localSummaryFacts(baseBranch, branch), baseBranch)) console.log(line);
   console.log(`    ${pr.url}`);
-  console.log('');
-  return pr.url;
 }
 
 // Offer to open the shipped PR(s) in the browser (new tabs). --open opens
@@ -1136,8 +1173,6 @@ async function offerOpenPrs(urls, opts = {}) {
   if (open) for (const url of urls) openUrl(url);
 }
 
-// Create the PR with `gh pr create` (or recognise the one already open), then
-// print its summary. Resolves with the PR's URL.
 // A branch can have open PRs into several bases at once (e.g. shipped to main
 // and to production), so PR lookups go by head *and* base rather than
 // `gh pr view <branch>`, which picks one of them regardless of the target.
@@ -1158,46 +1193,55 @@ async function openPrInto(branch, base) {
   return (await openPrsFrom(branch, base))[0] || null;
 }
 
-// `existingPr` is the in-flight openPrInto() cmdShip started before fetching
-// and pushing, so that lookup overlaps them instead of running after.
-async function shipViaGh(branch, baseBranch, opts = {}, existingPr) {
-  const existing = await step(`Check for an open PR into ${baseBranch}`, async (s) => {
-    const pr = await (existingPr || openPrInto(branch, baseBranch));
-    s.note(pr ? `PR #${pr.number}${pr.isDraft ? ' (draft)' : ''} already open — updated with your push` : 'none — creating one');
-    return pr;
-  });
-
-  let prRef = existing && existing.number;
-  if (!existing) {
-    const { title, body } = prTitleBody(baseBranch, branch);
-    const issueNum = branchIssue(branch);
-    const finalBody = withIssueClose(body, issueNum);
-    const { reviewers, labels, assignees } = prPeople(opts);
-
-    await step(`Create PR ${branch} → ${baseBranch}${opts.draft ? ' (draft)' : ''}`, async (s) => {
-      const r = await stepCmd('gh', prCreateArgs({
-        base: baseBranch,
-        head: branch,
-        title: title || branch,
-        body: finalBody,
-        draft: opts.draft,
-        reviewers,
-        labels,
-        assignees,
-      }));
-      const num = /\/pull\/(\d+)/.exec(r.stdout);
-      if (num) {
-        prRef = num[1];
-        s.note(`#${num[1]}`);
-      }
-      if (issueNum) s.detail(paint(2, `linking issue: Closes #${issueNum}`));
-      if (reviewers.length) s.detail(paint(2, `reviewers: ${reviewers.join(', ')}`));
-      if (labels.length) s.detail(paint(2, `labels: ${labels.join(', ')}`));
-      if (assignees.length) s.detail(paint(2, `assignees: ${assignees.join(', ')}`));
-    });
+// Make sure `branch` has an open PR into `baseBranch`: reuse the one already
+// open (`existingPr` is the lookup cmdShip started in the background) or create
+// it. Runs as one step and resolves with { number, url, isDraft }. Several
+// bases call this concurrently from a single steps() group.
+async function ensurePr(s, { repo, branch, baseBranch, opts, existingPr }) {
+  const existing = await (existingPr || openPrInto(branch, baseBranch));
+  if (existing) {
+    s.note(`#${existing.number}${existing.isDraft ? ' (draft)' : ''} already open — updated with your push`);
+    return existing;
   }
 
-  return showPrSummary(prRef, branch, baseBranch);
+  const { title, body } = prTitleBody(baseBranch, branch);
+  const issueNum = branchIssue(branch);
+  const { reviewers, labels, assignees } = prPeople(opts);
+  // "@me" needs the viewer's login — look it up alongside the create.
+  const meP = assignees.includes('@me') ? spawnCapture('gh', ['api', 'user', '--jq', '.login']) : null;
+
+  const r = await stepCmd('gh', prCreateArgs({
+    nwo: repo.nwo,
+    base: baseBranch,
+    head: branch,
+    title,
+    body: withIssueClose(body, issueNum),
+    draft: opts.draft,
+  }));
+  let created;
+  try {
+    created = JSON.parse(r.stdout);
+  } catch {
+    throw new StepFailure(`Unexpected response from GitHub:\n${r.stdout}`);
+  }
+  const pr = { number: created.number, url: created.html_url, isDraft: !!created.draft };
+  s.note(`#${pr.number} created`);
+  if (issueNum) s.detail(paint(2, `linking issue: Closes #${issueNum}`));
+
+  // Reviewers/labels/assignees: separate calls, run together. The PR exists
+  // by now, so a failure here warns instead of failing the ship.
+  const me = meP ? ((await meP).stdout || '').trim() : '';
+  const calls = prPeopleCalls({ nwo: repo.nwo, number: pr.number, reviewers, labels, assignees, me });
+  const results = await Promise.all(calls.map((c) => spawnCapture('gh', c.args)));
+  results.forEach((res, i) => {
+    if (res.status === 0) {
+      s.detail(paint(2, calls[i].what));
+    } else {
+      s.warn(`#${pr.number} created — some extras failed`);
+      s.detail(`${calls[i].what} — failed: ${(res.stderr || res.stdout).trim().split('\n')[0]}`);
+    }
+  });
+  return pr;
 }
 
 // `ship` needs a clean tree. Rather than just refuse, offer to stage everything
@@ -1294,6 +1338,56 @@ function cmdPull(opts = {}) {
   }
 }
 
+// Parse `git ls-remote --heads` output into a Map of branch name -> sha.
+// Exported for tests.
+function parseLsRemote(out) {
+  const heads = new Map();
+  for (const line of String(out || '').split('\n')) {
+    const m = line.match(/^([0-9a-f]+)\trefs\/heads\/(.+)$/);
+    if (m) heads.set(m[2], m[1]);
+  }
+  return heads;
+}
+
+// The local remote-tracking sha for origin/<branch>, or '' when there's none.
+function trackingSha(branch) {
+  const r = spawnSync('git', ['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}`], {
+    encoding: 'utf8',
+  });
+  return r.status === 0 ? r.stdout.trim() : '';
+}
+
+// ship's targeted stand-in for `git fetch --prune origin`. Asks origin for just
+// `branch` and `bases` (one ls-remote), and fetches the bases whose
+// origin/<base> is behind (skipped entirely when all are current). With
+// `pruneBranch` it also drops a stale origin/<branch> left after the branch was
+// deleted on origin — `git flow feature publish` checks local origin/* refs and
+// refuses if one lingers. (Not while a push of the branch runs alongside: that
+// push is what creates origin/<branch>.) Resolves with the Map of which of
+// those refs exist on origin (name -> sha).
+async function syncShipRefs(branch, bases, s, { pruneBranch = false } = {}) {
+  const names = uniq([...bases, branch]);
+  // Full refs/heads/ patterns: a bare name would also match e.g. foo/main.
+  const ls = await stepCmd('git', ['ls-remote', '--heads', 'origin', ...names.map((n) => `refs/heads/${n}`)]);
+  const remote = parseLsRemote(ls.stdout);
+
+  if (pruneBranch && !remote.has(branch) && trackingSha(branch)) {
+    spawnSync('git', ['update-ref', '-d', `refs/remotes/origin/${branch}`], { stdio: 'ignore' });
+  }
+
+  const stale = bases.filter((b) => remote.has(b) && trackingSha(b) !== remote.get(b));
+  if (stale.length) {
+    await stepCmd('git', [
+      'fetch', '--no-tags', 'origin',
+      ...stale.map((b) => `+refs/heads/${b}:refs/remotes/origin/${b}`),
+    ]);
+    s.note(`updated ${stale.join(', ')}`);
+  } else {
+    s.note('already current');
+  }
+  return remote;
+}
+
 // Ship the current branch to one or more destinations: push once, then open
 // (or update) a PR into each — e.g. `ship main production`.
 async function cmdShip(dests, opts = {}) {
@@ -1354,19 +1448,28 @@ async function cmdShip(dests, opts = {}) {
   // don't depend on either, and each is a full GitHub round-trip.
   const existingPrs = useGh ? bases.map((base) => openPrInto(branch, base)) : [];
 
-  // Drop stale remote-tracking refs (e.g. the branch was deleted on origin
-  // when a previous PR merged). `git flow feature publish` checks local
-  // origin/* refs, not the server, and refuses if a stale one lingers.
-  await step('Fetch origin', () => stepCmd('git', ['fetch', '--prune', 'origin']));
-
-  // The fetch --prune above just synced origin/* with the server, so local
-  // remote-tracking refs answer these without another ls-remote round-trip each.
-  const onOriginRef = (b) =>
-    spawnSync('git', ['show-ref', '--verify', '--quiet', `refs/remotes/origin/${b}`], {
-      stdio: 'ignore',
-    }).status === 0;
+  // Sync only the refs ship needs instead of `git fetch --prune origin`, which
+  // downloads every branch and tag on origin — the slow part on a busy repo.
+  // One ls-remote of just the bases + this branch answers whether they exist;
+  // then only bases that actually moved get fetched (none, often).
+  //
+  // A plain `git push -u` works whether or not the branch is on origin yet, so
+  // it runs alongside the fetch. Only `git flow feature publish` (a feature
+  // branch in a git-flow repo, not yet on origin) needs the fetch's answer
+  // first — that case stays sequential.
+  const flowRepo = isFeature && gitflowInitialized();
+  const fetchDef = { label: 'Fetch origin', work: (s) => syncShipRefs(branch, bases, s, { pruneBranch: flowRepo }) };
+  const pushDef = {
+    label: `Push ${branch}`,
+    work: async (s) => {
+      const r = await stepCmd('git', ['push', '-u', 'origin', branch]);
+      if (/\[new branch\]/.test(r.stderr)) s.note('new branch');
+      else if (/Everything up-to-date/.test(r.stderr)) s.note('already up to date');
+    },
+  };
+  const [remote] = await steps(flowRepo ? [fetchDef] : [fetchDef, pushDef]);
   for (const base of bases) {
-    if (onOriginRef(base)) continue;
+    if (remote.has(base)) continue;
     if (isStacked(base)) {
       fail(
         `Parent branch '${base}' isn't on origin yet — a stacked PR needs it first.`,
@@ -1381,36 +1484,28 @@ async function cmdShip(dests, opts = {}) {
     );
   }
 
-  const onOrigin = onOriginRef(branch);
-
-  const plan = publishPlan(onOrigin, isFeature, gitflowInitialized());
-  if (plan === 'push') {
-    // Branch already exists on origin — just push the latest commits.
-    await step(`Push ${branch}`, async (s) => {
-      const r = await stepCmd('git', ['push', 'origin', branch]);
-      if (/Everything up-to-date/.test(r.stderr)) s.note('already up to date');
-    });
-  } else if (plan === 'flow') {
-    await step(`Publish ${branch}`, async (s) => {
-      await stepCmd('git', ['flow', 'feature', 'publish', featureName]);
-      s.note('git flow feature publish');
-    });
-  } else {
-    await step(`Publish ${branch}`, async (s) => {
-      await stepCmd('git', ['push', '-u', 'origin', branch]);
-      // A feature-named branch in a repo without git-flow is published with a
-      // plain push instead of erroring on `git flow feature publish`.
-      s.note(isFeature ? 'new branch (git-flow not initialised — plain push)' : 'new branch');
-    });
+  if (flowRepo) {
+    if (publishPlan(remote.has(branch), isFeature, true) === 'flow') {
+      await step(`Publish ${branch}`, async (s) => {
+        await stepCmd('git', ['flow', 'feature', 'publish', featureName]);
+        s.note('git flow feature publish');
+      });
+    } else {
+      await steps([pushDef]);
+    }
   }
 
   if (useGh) {
-    const urls = [];
-    for (const [i, base] of bases.entries()) {
-      const url = await shipViaGh(branch, base, opts, existingPrs[i]);
-      if (url) urls.push(url);
-    }
-    await offerOpenPrs(urls, opts);
+    // One step per base, all at once — each reuses or creates its PR.
+    const prs = await steps(
+      bases.map((base, i) => ({
+        label: `PR ${branch} → ${base}${opts.draft ? ' (draft)' : ''}`,
+        work: (s) => ensurePr(s, { repo, branch, baseBranch: base, opts, existingPr: existingPrs[i] }),
+      }))
+    );
+    bases.forEach((base, i) => showPrSummary(prs[i], branch, base));
+    console.log('');
+    await offerOpenPrs(prs.map((p) => p.url), opts);
     console.log(`Check reviews/checks with: ${PROG} status`);
     if (bases.length > 1) {
       console.log(`When one is ready, merge it and clean up with: ${PROG} merge <dest>`);
@@ -3037,11 +3132,13 @@ module.exports = {
   splitList,
   uniq,
   prCreateArgs,
+  prPeopleCalls,
   tallyChecks,
   checksSummary,
   reviewSummary,
   prCellText,
   pickBranchPr,
+  parseLsRemote,
   isStackedBase,
   effectiveBaseOf,
   stackDepth,
@@ -3050,7 +3147,6 @@ module.exports = {
   branchLabel,
   renderList,
   withIssueClose,
-  prSummaryFacts,
   parseShortstat,
   localSummaryFacts,
   shipSummaryLines,

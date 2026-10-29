@@ -14,7 +14,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { pickBranchPr, prCellText } = require('../bin/git-shit.js');
+const { pickBranchPr, prCellText, parseLsRemote } = require('../bin/git-shit.js');
 
 const BIN = path.join(__dirname, '..', 'bin', 'git-shit.js');
 
@@ -51,6 +51,12 @@ eq(
   '#1 · open · also #2 -> production'
 );
 
+eq(
+  'ls-remote: parses heads, ignores junk',
+  [...parseLsRemote('abc123\trefs/heads/main\ndef456\trefs/heads/feature/x\nwarning: hi\n')],
+  [['main', 'abc123'], ['feature/x', 'def456']]
+);
+
 // --- e2e: ship / status / merge across two bases ------------------------------
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gsh-multi-'));
@@ -77,7 +83,7 @@ const path = require('path');
 const dir = ${JSON.stringify(prDir)};
 const a = process.argv.slice(2);
 const opt = (k) => { const i = a.indexOf(k); return i < 0 ? undefined : a[i + 1]; };
-const all = () => fs.readdirSync(dir).map((f) => JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')))
+const all = () => fs.readdirSync(dir).map((f) => fs.readFileSync(path.join(dir, f), 'utf8')).filter(Boolean).map((s) => JSON.parse(s))
   .sort((x, y) => y.number - x.number);
 const save = (pr) => fs.writeFileSync(path.join(dir, pr.number + '.json'), JSON.stringify(pr));
 const full = (pr) => ({ ...pr, url: 'https://github.com/acme/widgets/pull/' + pr.number, isDraft: false,
@@ -93,10 +99,18 @@ if (cmd === 'pr list') {
   console.log(JSON.stringify(prs.map(full)));
   process.exit(0);
 }
-if (cmd === 'pr create') {
-  const number = all().length + 1;
-  save({ number, headRefName: opt('--head'), baseRefName: opt('--base'), state: 'OPEN' });
-  console.log('https://github.com/acme/widgets/pull/' + number);
+if (a[0] === 'api' && a.includes('repos/acme/widgets/pulls')) {
+  // REST create: fields come as -f key=value.
+  const f = {};
+  a.forEach((x, i) => { if ((x === '-f' || x === '-F') && a[i + 1]) { const [k, ...v] = a[i + 1].split('='); f[k] = v.join('='); } });
+  // ship creates PRs for several bases concurrently: claim the next number
+  // atomically (exclusive create) so two creates never share one.
+  let number = all().length + 1;
+  for (;;) {
+    try { fs.closeSync(fs.openSync(path.join(dir, number + '.json'), 'wx')); break; } catch { number++; }
+  }
+  save({ number, headRefName: f.head, baseRefName: f.base, state: 'OPEN', title: f.title, draft: f.draft === 'true' });
+  console.log(JSON.stringify({ number, html_url: 'https://github.com/acme/widgets/pull/' + number, draft: f.draft === 'true' }));
   process.exit(0);
 }
 if (cmd === 'pr view') {
@@ -128,6 +142,8 @@ g(work, ['remote', 'add', 'origin', origin]);
 g(work, ['commit', '--quiet', '--allow-empty', '-m', 'init']);
 g(work, ['branch', '-M', 'main']);
 g(work, ['push', '--quiet', 'origin', 'main', 'main:production']);
+// A branch on origin that ship has no business fetching.
+g(root, ['--git-dir', path.join(root, 'origin.git'), 'branch', 'unrelated', 'main']);
 g(work, ['checkout', '--quiet', '-b', 'feature/x']);
 fs.writeFileSync(path.join(work, 'a.txt'), 'a\n');
 g(work, ['add', 'a.txt']);
@@ -142,38 +158,57 @@ function cli(...args) {
   });
   return { status: r.status, out: (r.stdout || '') + (r.stderr || '') };
 }
-const prs = () =>
-  fs.readdirSync(prDir).map((f) => JSON.parse(fs.readFileSync(path.join(prDir, f), 'utf8')))
-    .sort((x, y) => x.number - y.number)
-    .map((p) => `#${p.number} ${p.baseRefName} ${p.state}`);
+// PRs by base ("main OPEN", …). Bases, not numbers: ship creates the PRs for
+// several bases concurrently, so which one gets #1 isn't fixed.
+const prList = () =>
+  fs.readdirSync(prDir).map((f) => JSON.parse(fs.readFileSync(path.join(prDir, f), 'utf8')));
+const prs = () => prList().map((p) => `${p.baseRefName} ${p.state}`).sort();
+const numOf = (base) => prList().find((p) => p.baseRefName === base).number;
 
 let r = cli('ship', 'main', 'production');
 eq('ship two bases: exits 0', r.status, 0);
-eq('ship two bases: one PR into each', prs(), ['#1 main OPEN', '#2 production OPEN']);
-ok('ship two bases: pushed once', (r.out.match(/Publish feature\/x/g) || []).length === 2); // ▸ + ✓ lines
+eq('ship two bases: one PR into each', prs(), ['main OPEN', 'production OPEN']);
+const mainNum = numOf('main');
+const prodNum = numOf('production');
+ok('ship two bases: distinct PR numbers', mainNum !== prodNum);
+ok('ship two bases: pushed once', (r.out.match(/Push feature\/x/g) || []).length === 2); // ▸ + ✓ lines
 
 r = cli('ship', 'production');
-eq('re-ship production: no new PR', prs(), ['#1 main OPEN', '#2 production OPEN']);
-ok('re-ship production: finds #2, not the main PR', /PR #2 already open/.test(r.out));
+eq('re-ship production: no new PR', prs(), ['main OPEN', 'production OPEN']);
+ok('re-ship production: finds its PR, not the main one', new RegExp(`#${prodNum} already open`).test(r.out));
+
+ok('targeted fetch: unrelated origin branch not fetched', !g(work, ['branch', '-r']).includes('origin/unrelated'));
+ok('targeted fetch: nothing moved -> no fetch', /Fetch origin {2}already current/.test(r.out));
+
+// Someone else lands a commit on main; shipping to main must pick it up (the
+// PR body/summary/conflict check read origin/main), production stays put.
+const other = path.join(root, 'other');
+g(root, ['clone', '--quiet', '--branch', 'main', origin, other]);
+g(other, ['-c', 'user.email=o@e.st', '-c', 'user.name=O', 'commit', '--quiet', '--allow-empty', '-m', 'teammate']);
+g(other, ['push', '--quiet', 'origin', 'main']);
+const mainTip = g(other, ['rev-parse', 'HEAD']).trim();
+r = cli('ship', 'main');
+ok('targeted fetch: moved base gets fetched', /Fetch origin {2}updated main/.test(r.out));
+eq('targeted fetch: origin/main now current', g(work, ['rev-parse', 'origin/main']).trim(), mainTip);
 
 r = cli('status');
-ok('status: lists the main PR', /#1 -> main/.test(r.out));
-ok('status: lists the production PR', /#2 -> production/.test(r.out));
+ok('status: lists the main PR', r.out.includes(`#${mainNum} -> main`));
+ok('status: lists the production PR', r.out.includes(`#${prodNum} -> production`));
 
 r = cli('merge');
 ok('merge without dest: refuses', r.status !== 0);
 ok('merge without dest: suggests each dest', /merge main/.test(r.out) && /merge production/.test(r.out));
-eq('merge without dest: merged nothing', prs(), ['#1 main OPEN', '#2 production OPEN']);
+eq('merge without dest: merged nothing', prs(), ['main OPEN', 'production OPEN']);
 
 r = cli('merge', 'production');
 eq('merge production: exits 0', r.status, 0);
-eq('merge production: merged #2 only', prs(), ['#1 main OPEN', '#2 production MERGED']);
+eq('merge production: merged only that PR', prs(), ['main OPEN', 'production MERGED']);
 ok('merge production: keeps the branch', /Keeping 'feature\/x'/.test(r.out));
 eq('merge production: still on the branch', g(work, ['rev-parse', '--abbrev-ref', 'HEAD']).trim(), 'feature/x');
 
 r = cli('merge', 'main');
 eq('merge main: exits 0', r.status, 0);
-eq('merge main: merged #1', prs(), ['#1 main MERGED', '#2 production MERGED']);
+eq('merge main: merged it too', prs(), ['main MERGED', 'production MERGED']);
 eq('merge main: last PR cleans up (back on main)', g(work, ['rev-parse', '--abbrev-ref', 'HEAD']).trim(), 'main');
 ok('merge main: local branch deleted', !g(work, ['branch', '--list', 'feature/x']).trim());
 
