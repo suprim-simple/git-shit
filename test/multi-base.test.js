@@ -14,7 +14,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { pickBranchPr, prCellText } = require('../bin/git-shit.js');
+const { pickBranchPr, prCellText, parseLsRemote } = require('../bin/git-shit.js');
 
 const BIN = path.join(__dirname, '..', 'bin', 'git-shit.js');
 
@@ -49,6 +49,12 @@ eq(
   'cell: mentions the other open PRs',
   prCellText({ ...toMain, alsoOpen: [toProd] }, true, true),
   '#1 · open · also #2 -> production'
+);
+
+eq(
+  'ls-remote: parses heads, ignores junk',
+  [...parseLsRemote('abc123\trefs/heads/main\ndef456\trefs/heads/feature/x\nwarning: hi\n')],
+  [['main', 'abc123'], ['feature/x', 'def456']]
 );
 
 // --- e2e: ship / status / merge across two bases ------------------------------
@@ -128,6 +134,8 @@ g(work, ['remote', 'add', 'origin', origin]);
 g(work, ['commit', '--quiet', '--allow-empty', '-m', 'init']);
 g(work, ['branch', '-M', 'main']);
 g(work, ['push', '--quiet', 'origin', 'main', 'main:production']);
+// A branch on origin that ship has no business fetching.
+g(root, ['--git-dir', path.join(root, 'origin.git'), 'branch', 'unrelated', 'main']);
 g(work, ['checkout', '--quiet', '-b', 'feature/x']);
 fs.writeFileSync(path.join(work, 'a.txt'), 'a\n');
 g(work, ['add', 'a.txt']);
@@ -155,6 +163,20 @@ ok('ship two bases: pushed once', (r.out.match(/Publish feature\/x/g) || []).len
 r = cli('ship', 'production');
 eq('re-ship production: no new PR', prs(), ['#1 main OPEN', '#2 production OPEN']);
 ok('re-ship production: finds #2, not the main PR', /PR #2 already open/.test(r.out));
+
+ok('targeted fetch: unrelated origin branch not fetched', !g(work, ['branch', '-r']).includes('origin/unrelated'));
+ok('targeted fetch: nothing moved -> no fetch', /Fetch origin {2}already current/.test(r.out));
+
+// Someone else lands a commit on main; shipping to main must pick it up (the
+// PR body/summary/conflict check read origin/main), production stays put.
+const other = path.join(root, 'other');
+g(root, ['clone', '--quiet', '--branch', 'main', origin, other]);
+g(other, ['-c', 'user.email=o@e.st', '-c', 'user.name=O', 'commit', '--quiet', '--allow-empty', '-m', 'teammate']);
+g(other, ['push', '--quiet', 'origin', 'main']);
+const mainTip = g(other, ['rev-parse', 'HEAD']).trim();
+r = cli('ship', 'main');
+ok('targeted fetch: moved base gets fetched', /Fetch origin {2}updated main/.test(r.out));
+eq('targeted fetch: origin/main now current', g(work, ['rev-parse', 'origin/main']).trim(), mainTip);
 
 r = cli('status');
 ok('status: lists the main PR', /#1 -> main/.test(r.out));

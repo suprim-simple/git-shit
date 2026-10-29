@@ -111,7 +111,7 @@ git-shit ship                      # PR: feature/ui -> feature/api
 
    **Several destinations** — `git-shit ship main production` checks every destination exists, pushes the branch once, then creates (or finds) a PR into each, with a summary per PR and one prompt to open them all. An existing PR only counts if it targets that destination, so shipping a branch to `main` and later to `production` opens a second PR rather than mistaking the first for it.
 
-   Progress is shown CI-style: each step (fetch, push, check/create PR, summary) shows a spinner with a live timer, then ✓ / ! / ✗ and how long it took. Git and `gh` output is only printed when a step fails.
+   Progress is shown CI-style: each step (fetch, push, check/create PR, summary) shows a spinner with a live timer, then ✓ / ! / ✗ and how long it took. Git and `gh` output is only printed when a step fails. The fetch step is targeted: one `git ls-remote` asks origin for just the destination(s) and your branch, and only destinations that moved since your last fetch are downloaded — not every branch and tag on origin.
 
 4. Prints a **summary** of what you just shipped:
 

@@ -1294,6 +1294,54 @@ function cmdPull(opts = {}) {
   }
 }
 
+// Parse `git ls-remote --heads` output into a Map of branch name -> sha.
+// Exported for tests.
+function parseLsRemote(out) {
+  const heads = new Map();
+  for (const line of String(out || '').split('\n')) {
+    const m = line.match(/^([0-9a-f]+)\trefs\/heads\/(.+)$/);
+    if (m) heads.set(m[2], m[1]);
+  }
+  return heads;
+}
+
+// The local remote-tracking sha for origin/<branch>, or '' when there's none.
+function trackingSha(branch) {
+  const r = spawnSync('git', ['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}`], {
+    encoding: 'utf8',
+  });
+  return r.status === 0 ? r.stdout.trim() : '';
+}
+
+// ship's targeted stand-in for `git fetch --prune origin`. Asks origin for just
+// `branch` and `bases` (one ls-remote), fetches the bases whose origin/<base>
+// is behind (skipped entirely when all are current), and drops a stale
+// origin/<branch> left after the branch was deleted on origin — `git flow
+// feature publish` checks local origin/* refs and refuses if one lingers.
+// Resolves with the Map of which of those refs exist on origin (name -> sha).
+async function syncShipRefs(branch, bases, s) {
+  const names = uniq([...bases, branch]);
+  // Full refs/heads/ patterns: a bare name would also match e.g. foo/main.
+  const ls = await stepCmd('git', ['ls-remote', '--heads', 'origin', ...names.map((n) => `refs/heads/${n}`)]);
+  const remote = parseLsRemote(ls.stdout);
+
+  if (!remote.has(branch) && trackingSha(branch)) {
+    spawnSync('git', ['update-ref', '-d', `refs/remotes/origin/${branch}`], { stdio: 'ignore' });
+  }
+
+  const stale = bases.filter((b) => remote.has(b) && trackingSha(b) !== remote.get(b));
+  if (stale.length) {
+    await stepCmd('git', [
+      'fetch', '--no-tags', 'origin',
+      ...stale.map((b) => `+refs/heads/${b}:refs/remotes/origin/${b}`),
+    ]);
+    s.note(`updated ${stale.join(', ')}`);
+  } else {
+    s.note('already current');
+  }
+  return remote;
+}
+
 // Ship the current branch to one or more destinations: push once, then open
 // (or update) a PR into each — e.g. `ship main production`.
 async function cmdShip(dests, opts = {}) {
@@ -1354,19 +1402,13 @@ async function cmdShip(dests, opts = {}) {
   // don't depend on either, and each is a full GitHub round-trip.
   const existingPrs = useGh ? bases.map((base) => openPrInto(branch, base)) : [];
 
-  // Drop stale remote-tracking refs (e.g. the branch was deleted on origin
-  // when a previous PR merged). `git flow feature publish` checks local
-  // origin/* refs, not the server, and refuses if a stale one lingers.
-  await step('Fetch origin', () => stepCmd('git', ['fetch', '--prune', 'origin']));
-
-  // The fetch --prune above just synced origin/* with the server, so local
-  // remote-tracking refs answer these without another ls-remote round-trip each.
-  const onOriginRef = (b) =>
-    spawnSync('git', ['show-ref', '--verify', '--quiet', `refs/remotes/origin/${b}`], {
-      stdio: 'ignore',
-    }).status === 0;
+  // Sync only the refs ship needs instead of `git fetch --prune origin`, which
+  // downloads every branch and tag on origin — the slow part on a busy repo.
+  // One ls-remote of just the bases + this branch answers whether they exist;
+  // then only bases that actually moved get fetched (none, often).
+  const remote = await step('Fetch origin', (s) => syncShipRefs(branch, bases, s));
   for (const base of bases) {
-    if (onOriginRef(base)) continue;
+    if (remote.has(base)) continue;
     if (isStacked(base)) {
       fail(
         `Parent branch '${base}' isn't on origin yet — a stacked PR needs it first.`,
@@ -1381,7 +1423,7 @@ async function cmdShip(dests, opts = {}) {
     );
   }
 
-  const onOrigin = onOriginRef(branch);
+  const onOrigin = remote.has(branch);
 
   const plan = publishPlan(onOrigin, isFeature, gitflowInitialized());
   if (plan === 'push') {
@@ -3042,6 +3084,7 @@ module.exports = {
   reviewSummary,
   prCellText,
   pickBranchPr,
+  parseLsRemote,
   isStackedBase,
   effectiveBaseOf,
   stackDepth,
