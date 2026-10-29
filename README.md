@@ -111,7 +111,7 @@ git-shit ship                      # PR: feature/ui -> feature/api
 
    **Several destinations** — `git-shit ship main production` checks every destination exists, pushes the branch once, then creates (or finds) a PR into each, with a summary per PR and one prompt to open them all. An existing PR only counts if it targets that destination, so shipping a branch to `main` and later to `production` opens a second PR rather than mistaking the first for it.
 
-   Progress is shown CI-style: each step (fetch, push, check/create PR, summary) shows a spinner with a live timer, then ✓ / ! / ✗ and how long it took. Git and `gh` output is only printed when a step fails. The fetch step is targeted: one `git ls-remote` asks origin for just the destination(s) and your branch, and only destinations that moved since your last fetch are downloaded — not every branch and tag on origin.
+   Progress is shown CI-style: each step (fetch, push, check/create PR, summary) shows a spinner with a live timer, then ✓ / ! / ✗ and how long it took. Git and `gh` output is only printed when a step fails. The fetch step is targeted: one `git ls-remote` asks origin for just the destination(s) and your branch, and only destinations that moved since your last fetch are downloaded — not every branch and tag on origin. Independent steps run side by side, like parallel CI jobs: the push runs alongside the fetch (except a first `git flow feature publish`, which needs the fetch's answer first), and with several destinations their PRs are created at the same time. PRs are created with a single GitHub API call (`gh api`) rather than `gh pr create`, which spends over a second on its own lookups first; reviewers, labels and assignees are added right after, in parallel — if one of those fails, the PR still stands and the step shows `!` with the reason.
 
 4. Prints a **summary** of what you just shipped:
 
@@ -119,14 +119,13 @@ git-shit ship                      # PR: feature/ui -> feature/api
    ==> PR #42: feature/new-nav -> staging
        commits:   3
        files:     4 changed  (+120 / -7)
-       checks:    1/2
        conflicts: none — merges cleanly into staging
        https://github.com/acme/widgets/pull/42
 
    o open PR in browser · any other key to finish
    ```
 
-   With `gh`, the numbers are GitHub's view of the PR. Checks have usually only just started at this point, and if GitHub is still working out mergeability after a few seconds, `conflicts` shows *unknown*. On conflicts, run `git-shit sync`. Press `o` (or Enter) to open the PR in a new browser tab, any other key to finish, or pass `--open` to open it without the prompt. In the browser flow, the same summary (minus checks) is computed locally against `origin/<base>` before the PR page opens. Conflict detection there needs git ≥ 2.38 (`git merge-tree --write-tree`).
+   The summary is computed locally against `origin/<base>` — `ship` has just pushed the branch and fetched the base, so it matches what GitHub shows, with no extra round-trip (GitHub's own mergeability is usually still being computed this soon after a push). Checks haven't started yet at this point; follow them with `git-shit status`. On conflicts, run `git-shit sync`. Press `o` (or Enter) to open the PR in a new browser tab, any other key to finish, or pass `--open` to open it without the prompt. Conflict detection needs git ≥ 2.38 (`git merge-tree --write-tree`); on older git it shows *unknown*.
 
 **Reviewers, labels, and assignees** (GitHub + `gh`, on PR creation): pass `--reviewer=alice,bob`, `--label=feature,needs-qa`, or `--assignee=@me` (comma-separated, use the `=` form). Each is unioned with a per-repo default from git config — set `gitshit.reviewers`, `gitshit.labels`, and `gitshit.assignees` once and every PR gets them for free (see [Configuration](#configuration)). They only apply when a new PR is created, and are ignored (with a note) in the Bitbucket/browser flow.
 

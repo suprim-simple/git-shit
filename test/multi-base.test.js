@@ -99,10 +99,13 @@ if (cmd === 'pr list') {
   console.log(JSON.stringify(prs.map(full)));
   process.exit(0);
 }
-if (cmd === 'pr create') {
+if (a[0] === 'api' && a.includes('repos/acme/widgets/pulls')) {
+  // REST create: fields come as -f key=value.
+  const f = {};
+  a.forEach((x, i) => { if ((x === '-f' || x === '-F') && a[i + 1]) { const [k, ...v] = a[i + 1].split('='); f[k] = v.join('='); } });
   const number = all().length + 1;
-  save({ number, headRefName: opt('--head'), baseRefName: opt('--base'), state: 'OPEN' });
-  console.log('https://github.com/acme/widgets/pull/' + number);
+  save({ number, headRefName: f.head, baseRefName: f.base, state: 'OPEN', title: f.title, draft: f.draft === 'true' });
+  console.log(JSON.stringify({ number, html_url: 'https://github.com/acme/widgets/pull/' + number, draft: f.draft === 'true' }));
   process.exit(0);
 }
 if (cmd === 'pr view') {
@@ -158,11 +161,11 @@ const prs = () =>
 let r = cli('ship', 'main', 'production');
 eq('ship two bases: exits 0', r.status, 0);
 eq('ship two bases: one PR into each', prs(), ['#1 main OPEN', '#2 production OPEN']);
-ok('ship two bases: pushed once', (r.out.match(/Publish feature\/x/g) || []).length === 2); // ▸ + ✓ lines
+ok('ship two bases: pushed once', (r.out.match(/Push feature\/x/g) || []).length === 2); // ▸ + ✓ lines
 
 r = cli('ship', 'production');
 eq('re-ship production: no new PR', prs(), ['#1 main OPEN', '#2 production OPEN']);
-ok('re-ship production: finds #2, not the main PR', /PR #2 already open/.test(r.out));
+ok('re-ship production: finds #2, not the main PR', /#2 already open/.test(r.out));
 
 ok('targeted fetch: unrelated origin branch not fetched', !g(work, ['branch', '-r']).includes('origin/unrelated'));
 ok('targeted fetch: nothing moved -> no fetch', /Fetch origin {2}already current/.test(r.out));

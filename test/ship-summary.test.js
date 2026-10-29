@@ -1,7 +1,7 @@
 'use strict';
-// Tests for the post-`ship` summary: the pure gh-facts normaliser, shortstat
-// parser and line formatter, plus a real-repo check that the local (browser
-// flow) facts count commits/files and detect conflicts with the base.
+// Tests for the post-`ship` summary: the shortstat parser and line formatter,
+// plus a real-repo check that the local facts count commits/files and detect
+// conflicts with the base.
 
 const { execFileSync } = require('child_process');
 const fs = require('fs');
@@ -9,7 +9,6 @@ const os = require('os');
 const path = require('path');
 
 const {
-  prSummaryFacts,
   parseShortstat,
   localSummaryFacts,
   shipSummaryLines,
@@ -33,19 +32,9 @@ function g(cwd, args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
-// --- prSummaryFacts (pure) ---------------------------------------------------
-const facts = prSummaryFacts({
-  commits: [{}, {}, {}],
-  changedFiles: 4,
-  additions: 120,
-  deletions: 7,
-  mergeable: 'MERGEABLE',
-  statusCheckRollup: [{ conclusion: 'SUCCESS' }, { status: 'IN_PROGRESS' }],
-});
-eq('gh facts', facts, { commits: 3, files: 4, additions: 120, deletions: 7, conflicts: false, checks: 'checks: 1/2' });
-eq('gh conflicting', prSummaryFacts({ mergeable: 'CONFLICTING' }).conflicts, true);
-eq('gh unknown mergeability', prSummaryFacts({ mergeable: 'UNKNOWN' }).conflicts, null);
-eq('gh no checks yet', prSummaryFacts({}).checks, 'checks: none reported yet');
+// A summary's facts, as localSummaryFacts produces them (checks only appear
+// when set).
+const facts = { commits: 3, files: 4, additions: 120, deletions: 7, conflicts: false, checks: 'checks: 1/2' };
 
 // --- parseShortstat (pure) ---------------------------------------------------
 eq('shortstat full', parseShortstat(' 3 files changed, 10 insertions(+), 2 deletions(-)'), { files: 3, additions: 10, deletions: 2 });
